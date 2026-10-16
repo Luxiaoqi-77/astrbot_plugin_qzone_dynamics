@@ -22,8 +22,8 @@ from data.plugins.astrbot_plugin_qzone_dynamics.comment_workflow import (
 )
 
 ROOT = Path(__file__).parent
-BOT_UIN = "2258780898"
-OWNER_UIN = "2870791457"
+BOT_UIN = "100000002"
+OWNER_UIN = "100000001"
 POST_ID = "post-1"
 
 

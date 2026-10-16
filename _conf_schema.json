@@ -50,9 +50,9 @@
     "default": false
   },
   "bot_account_uin": {
-    "description": "QQ 空间评论执行账号，仅允许已授权小回小号 2258780898。Cookie 和帖子作者属于小号；操作用户仍由 authorized_user_qq=2870791457 与精确 UMO 控制。其他账号值会阻止评论流程。",
+    "description": "QQ 空间评论执行账号，仅允许已授权小回小号 100000002。Cookie 和帖子作者属于小号；操作用户仍由 authorized_user_qq=100000001 与精确 UMO 控制。其他账号值会阻止评论流程。",
     "type": "string",
-    "default": "2258780898"
+    "default": "100000002"
   },
   "comment_max_comments": {
     "description": "单条动态的评论及回复总数上限，范围 1–99。要求服务端明确总数与完整关系校验；无总数为完整性未知，拒绝生成/发送并提示 QQ 内人工复核。",

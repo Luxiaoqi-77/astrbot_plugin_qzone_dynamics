@@ -4,7 +4,7 @@
       "code": 0,
       "data": {
         "comments": [
-          {"tid": "11", "uin": "2870791457", "content": "第一条子回复"}
+          {"tid": "11", "uin": "100000001", "content": "第一条子回复"}
         ],
         "reply_num": 2,
         "has_more": true,
@@ -15,7 +15,7 @@
       "code": 0,
       "data": {
         "comments": [
-          {"tid": "12", "uin": "2870791457", "content": "第二条子回复"}
+          {"tid": "12", "uin": "100000001", "content": "第二条子回复"}
         ],
         "reply_num": 2,
         "has_more": false,
@@ -28,7 +28,7 @@
       "code": 0,
       "data": {
         "comments": [
-          {"tid": "11", "uin": "2870791457", "content": "唯一一条"}
+          {"tid": "11", "uin": "100000001", "content": "唯一一条"}
         ],
         "reply_num": 1
       }
@@ -38,7 +38,7 @@
     "tid": "root-1",
     "reply_num": 2,
     "list_3": [
-      {"tid": "11", "uin": "2870791457", "content": "已嵌入的一条"}
+      {"tid": "11", "uin": "100000001", "content": "已嵌入的一条"}
     ]
   }
 }

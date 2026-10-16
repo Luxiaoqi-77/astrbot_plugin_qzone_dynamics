@@ -47,10 +47,10 @@ from .image_assets import (
 from .source_adapter import VirtualLifeSourceAdapter
 from .weekly_schedule import WeeklyScheduleStore
 
-AUTO_TARGET_USER = "2870791457"
-AUTO_TARGET_UMO = "qq_napcat_2258780898:FriendMessage:2870791457"
-COMMENT_BOT_ACCOUNT_UIN = "2258780898"
-COMMENT_OWNER_ACTOR_UIN = "2870791457"
+AUTO_TARGET_USER = "100000001"
+AUTO_TARGET_UMO = "qq_napcat_100000002:FriendMessage:100000001"
+COMMENT_BOT_ACCOUNT_UIN = "100000002"
+COMMENT_OWNER_ACTOR_UIN = "100000001"
 
 
 class QzoneDynamicsPlugin(Star):

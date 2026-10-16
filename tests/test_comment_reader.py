@@ -13,8 +13,8 @@ from data.plugins.astrbot_plugin_qzone_dynamics.comment_reader import (
     flatten_detail_comments,
 )
 
-BOT_UIN = "2258780898"
-OWNER_UIN = "2870791457"
+BOT_UIN = "100000002"
+OWNER_UIN = "100000001"
 POST_ID = "post-1"
 
 

@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-OWNER_ID = "2870791457"
-ASSISTANT_ID = "2258780898"
+OWNER_ID = "100000001"
+ASSISTANT_ID = "100000002"
 
 
 class MemorySyncBlocked(ValueError):
