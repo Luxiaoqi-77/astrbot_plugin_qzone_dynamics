@@ -65,6 +65,8 @@ class SafeDraftInput:
     source_reservation_token: str = ""
     primary_source_requires_review: bool = False
     primary_source_review_reason: str = ""
+    # 2026-10-16：当天命中的"重要日子"（已按 qzone 渠道过滤、含侧重），供提示词注入。
+    important_dates: tuple[str, ...] = ()
 
     @property
     def source_key(self) -> str:

@@ -311,6 +311,17 @@ class VirtualLifeSourceAdapter:
             source_labels += ("VirtualLife：当前或刚结束的虚构日程活动",)
         if mood:
             source_labels += ("task-14 read_fictional_mood_v1：label/intensity/updated_at",)
+        # 2026-10-16：当天命中的"重要日子"（qzone 渠道）——只在生成提示词里注入，不改发布规则。
+        important_dates = ()
+        try:
+            try:
+                from data.plugins.important_dates import today_lines
+            except ImportError:  # pragma: no cover
+                from important_dates import today_lines  # type: ignore
+            important_dates = tuple(today_lines("qzone"))
+        except Exception:
+            important_dates = ()
+
         return SafeDraftInput(
             persona_id=persona_id,
             source_date=source_date,
@@ -325,4 +336,5 @@ class VirtualLifeSourceAdapter:
             mood_intensity=mood_intensity,
             mood_time=mood_time,
             source_labels=source_labels,
+            important_dates=important_dates,
         )

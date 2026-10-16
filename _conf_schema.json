@@ -15,7 +15,7 @@
     "default": ""
   },
   "auto_draft_enabled": {
-    "description": "启用每周 5 次随机时段的自动生成流程。仅配合 auto_publish_enabled 与全部安全闸门生效；默认关闭。",
+    "description": "启用每天 1 条的自动生成流程。仅配合 auto_publish_enabled 与全部安全闸门生效；默认关闭。",
     "type": "bool",
     "default": false
   },

@@ -6,7 +6,7 @@ import json
 import random
 import re
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -299,9 +299,34 @@ class QzoneDynamicsPlugin(Star):
                 pass
             await asyncio.sleep(30)
 
+    @staticmethod
+    def _important_date_slots(now: datetime) -> tuple[list, dict]:
+        """给周计划用的"重要日子"日期与固定时刻（限定下一个完整周）；失败返回空。
+
+        2026-10-16：让周计划把 5 个槽中的一个钉在重要日子上（槽数不变）；
+        若该日子填了"当天几点发"，则那个槽用它指定的时刻。
+        """
+        try:
+            try:
+                from data.plugins.important_dates import day_times, days_with_events
+            except ImportError:  # pragma: no cover
+                from important_dates import day_times, days_with_events  # type: ignore
+            from .weekly_schedule import next_full_week
+
+            monday = next_full_week(now)
+            sunday = monday + timedelta(days=6)
+            dates = days_with_events(monday, sunday, channel="qzone")
+            times = day_times(monday, sunday, channel="qzone")
+            return dates, times
+        except Exception:
+            return [], {}
+
     async def _auto_publish_tick(self):
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        slot = self._auto_schedule.claim_due(now)
+        special_dates, special_times = self._important_date_slots(now)
+        slot = self._auto_schedule.claim_due(
+            now, special_dates=special_dates, special_times=special_times
+        )
         if slot is None:
             return
         result, draft_id, remote_tid = "skipped", "", ""
