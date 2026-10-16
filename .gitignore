@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+data/
+temp/
+*.log
+# 运行期台账（含本地动态/远端 id，不入库）
+historical_success_receipts.json
+.DS_Store

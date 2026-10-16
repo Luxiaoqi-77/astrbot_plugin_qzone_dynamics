@@ -1,0 +1,113 @@
+{
+  "enabled": {
+    "description": "启用 QQ 空间动态草稿插件。独立于虚构心情插件。",
+    "type": "bool",
+    "default": false
+  },
+  "authorized_user_qq": {
+    "description": "允许执行本插件命令的单个 QQ 用户号；为空或不匹配时拒绝所有命令。",
+    "type": "string",
+    "default": ""
+  },
+  "authorized_umo": {
+    "description": "允许执行本插件命令的完整 UMO；为空或不精确匹配时拒绝所有命令。",
+    "type": "string",
+    "default": ""
+  },
+  "auto_draft_enabled": {
+    "description": "启用每周 5 次随机时段的自动生成流程。仅配合 auto_publish_enabled 与全部安全闸门生效；默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "auto_publish_enabled": {
+    "description": "明确启用自动好友可见纯文字发布；需插件、自动生成、publish_enabled 与公开人设审阅闸门均开启，且范围严格为好友可见。默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "public_profile_reviewed": {
+    "description": "仅在人工审阅独立公开角色名与描述后开启；不得使用私人 persona 或聊天内容。默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "public_profile_review_hash": {
+    "description": "将审阅绑定到公开角色名和描述的精确 SHA-256；任一文本变化后自动发布停用。默认留空。",
+    "type": "string",
+    "default": ""
+  },
+  "publish_enabled": {
+    "description": "允许通过 NapCat send_qzone_msg 发布；每条仍需管理员提供已审核正文对应的确认码。默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "image_enabled": {
+    "description": "允许管理员为手工审核草稿附加已有相机图，或显式调用一次本地相机文件生成接口；默认关闭。不会自动生成或定时发布图片。",
+    "type": "bool",
+    "default": false
+  },
+  "comment_reply_enabled": {
+    "description": "允许配置所有者在精确好友私聊中手工读取一条本人动态的评论、生成候选回复并二次确认发送。社区路由未完成真实账号兼容验收；保持关闭，默认 false。",
+    "type": "bool",
+    "default": false
+  },
+  "bot_account_uin": {
+    "description": "QQ 空间评论执行账号，仅允许已授权小回小号 2258780898。Cookie 和帖子作者属于小号；操作用户仍由 authorized_user_qq=2870791457 与精确 UMO 控制。其他账号值会阻止评论流程。",
+    "type": "string",
+    "default": "2258780898"
+  },
+  "comment_max_comments": {
+    "description": "单条动态的评论及回复总数上限，范围 1–99。要求服务端明确总数与完整关系校验；无总数为完整性未知，拒绝生成/发送并提示 QQ 内人工复核。",
+    "type": "int",
+    "default": 20,
+    "minimum": 1,
+    "maximum": 99
+  },
+  "comment_auto_reply_enabled": {
+    "description": "自动生成或发送评论回复的独立开关。候选不实现自动发送；默认 false，必须保持关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "include_mood": {
+    "description": "仅调用 task-14 的 read_fictional_mood_v1 安全只读接口；需要其跨插件开关、精确 caller/persona/session scope 授权且快照不超过 24 小时，否则省略心情。默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "text_backend_mode": {
+    "description": "选择文字来源。AstrBot provider 模式每次按授权 UMO 解析当前聊天模型（含会话覆盖与 profile）；缺失/无效/不支持异步 text_chat 时拒绝生成，不回退模板。",
+    "type": "string",
+    "options": ["astrbot_provider", "local_template"],
+    "labels": ["当前会话聊天模型", "本地模板（显式选择）"],
+    "default": "astrbot_provider"
+  },
+  "text_provider_id": {
+    "description": "已弃用并忽略，仅为旧配置兼容保留。文字生成始终跟随授权 UMO 当前聊天模型。",
+    "type": "string",
+    "default": ""
+  },
+  "virtual_life_persona_id": {
+    "description": "VirtualLife 虚构日程的人格 ID；留空时使用 AstrBot 全局默认人格 ID，不读取会话人格、persona prompt 或私人聊天。",
+    "type": "string",
+    "default": ""
+  },
+  "public_character_name": {
+    "description": "仅供 QQ 空间草稿使用的独立公开角色名；不写入或修改 AstrBot persona。留空时不生成。",
+    "type": "string",
+    "default": ""
+  },
+  "public_character_description": {
+    "description": "仅供 QQ 空间草稿使用的独立公开角色描述，最多 400 字；不写入或修改 AstrBot persona。留空时不生成。",
+    "type": "string",
+    "default": ""
+  },
+  "publish_ugc_right": {
+    "description": "未来发布必选的查看范围：1所有人、4好友、16指定好友、64仅自己、128指定好友不可见。留空时拒绝构造发布请求。",
+    "type": "string",
+    "options": ["", "1", "4", "16", "64", "128"],
+    "labels": ["未选择", "所有人可见", "好友可见", "指定好友可见", "仅自己可见", "指定好友不可见"],
+    "default": ""
+  },
+  "publish_target_uins": {
+    "description": "ugc_right=16 或 128 时必填的 QQ 号列表；其它范围留空。",
+    "type": "list",
+    "default": []
+  }
+}
