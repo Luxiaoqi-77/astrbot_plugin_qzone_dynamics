@@ -9,10 +9,11 @@ import os
 import re
 import threading
 import uuid
+from collections.abc import Awaitable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Awaitable, Protocol
+from typing import Protocol
 
 ALLOWED_UGC_RIGHT = frozenset({1, 4, 16, 64, 128})
 TARGETED_UGC_RIGHT = frozenset({16, 128})
@@ -826,6 +827,6 @@ def confirmation_code_for_draft(
     if draft.approved_audience_hash != current_audience_hash:
         return ""
     confirmation_digest = hashlib.sha256(
-        f"{draft.approved_content_hash}\0{current_audience_hash}".encode("utf-8")
+        f"{draft.approved_content_hash}\0{current_audience_hash}".encode()
     ).hexdigest()
     return f"确认-{confirmation_digest[:8]}"

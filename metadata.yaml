@@ -1,7 +1,7 @@
 name: astrbot_plugin_qzone_dynamics
 display_name: QQ空间动态
-desc: 从 VirtualLife 虚构日程与独立公开角色配置生成动态；含默认关闭的周度纯文字自动发布选项。
-version: 0.1.1
+desc: 从 VirtualLife 日程生成 QQ 空间动态，支持审核发布、自动带图、评论自动回复与楼内追问。
+version: 0.2.0
 author: Codex prototype
 astrbot_version: ">=4.28.2,<5"
 support_platforms:

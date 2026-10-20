@@ -10,7 +10,6 @@ from urllib.parse import unquote, urlparse
 
 from .core import _reject_health_terms, clean_source_text
 
-
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 IMAGE_SIGNATURES = {
     ".jpg": ((b"\xff\xd8\xff", "image/jpeg"),),
@@ -18,6 +17,59 @@ IMAGE_SIGNATURES = {
     ".png": ((b"\x89PNG\r\n\x1a\n", "image/png"),),
     ".webp": ((b"RIFF", "image/webp"),),
 }
+
+# 2026-10-20：和 Moment 同一套关键词主体。必须写出**一个具体主体**，
+# 绝不写成“请从 A、B、C 中选择”——菜单式表述会让相机的 classify_subject()
+# 返回 unknown，图片通道会被永久卡死。
+QZONE_SUBJECT_HINTS: tuple[tuple[str, str], ...] = (
+    ("猫", "路边一只慵懒的猫"),
+    ("狗", "一只摇着尾巴的小狗"),
+    ("小动物", "一只可爱的小动物"),
+    ("咖啡", "桌上一杯冒着热气的咖啡"),
+    ("奶茶", "手边放着一杯奶茶"),
+    ("面馆", "一碗刚端上来的面"),
+    ("一碗面", "一碗刚端上来的面"),
+    ("面条", "一碗刚端上来的面"),
+    ("吃面", "一碗刚端上来的面"),
+    ("拉面", "一碗刚端上来的面"),
+    ("饭", "桌上简单的家常菜"),
+    ("吃", "桌上的一餐饭"),
+    ("书", "摊开的一本书"),
+    ("雨", "雨后湿漉漉的街道"),
+    ("雪", "覆着薄雪的街景"),
+    ("夜", "窗外的夜色"),
+    ("花丛", "路边开着的一丛花"),
+    ("开花", "路边开着的一丛花"),
+    ("鲜花", "路边开着的一丛花"),
+    ("一朵花", "路边开着的一丛花"),
+    ("街", "窗外安静的街景"),
+    ("天空", "抬头看到的天空"),
+    ("云", "天上的云"),
+    ("海", "远处的海面"),
+    ("路灯", "亮起来的路灯"),
+)
+
+
+def qzone_image_subject(content: str) -> str:
+    """Pick one explicit image subject from the draft text."""
+    text = str(content or "")
+    for keyword, subject in QZONE_SUBJECT_HINTS:
+        if keyword in text:
+            return subject
+    return "沈星回本人"
+
+
+def build_qzone_image_request(content: str) -> str:
+    """Build a camera request with exactly one explicit subject."""
+    clip = str(content or "").strip()[:300].rstrip("。！？!?…，,、 ")
+    subject = qzone_image_subject(content)
+    if subject == "沈星回本人":
+        return (
+            f"沈星回本人的生活随拍，画面主体是沈星回本人，用来配这条动态：{clip}。"
+            "不出现用户或其他真实人物，不加文字、水印或拼贴。"
+        )
+    return f"{subject}的照片，用来配这条动态：{clip}。不加文字、水印或拼贴。"
+
 
 
 def stage_camera_image(filename: str, camera_images: Path, asset_dir: Path) -> str:
@@ -112,11 +164,7 @@ async def generate_qzone_camera_asset(camera: object, caption: str, asset_dir: P
     image_dir = getattr(camera, "image_dir", None)
     if not callable(generator) or image_dir is None:
         raise ValueError("the existing camera file generator is unavailable")
-    prompt = (
-        "为这条QQ空间动态配一张自然真实的照片，主体是沈星回本人或他的生活物件；"
-        "人物画面使用相机插件现有身份参考，不出现用户或其他真实人物，不加文字和水印。"
-        f"动态配文仅作构思背景：{safe_caption}"
-    )
+    prompt = build_qzone_image_request(safe_caption)
     result = await generator(prompt, persona_context="")
     if not isinstance(result, Path) or result.is_symlink():
         raise ValueError("camera did not return a safe local image path")

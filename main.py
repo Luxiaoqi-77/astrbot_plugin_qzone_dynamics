@@ -5,6 +5,7 @@ import hashlib
 import json
 import random
 import re
+import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,25 @@ from .adapters import (
     NapCatQzonePublisher,
     TextProviderUnavailable,
 )
+from .auto_comments import AutoCommentReplies
+from .auto_images import AutoImageQuota, AutoImageStoreUnavailable
+from .comment_reader import (
+    QzoneCommentReader,
+    QzoneCommentReadError,
+    QzoneCommentReplySender,
+)
+from .comment_reply import CommentReplyReceipts
+from .comment_transport import (
+    MacOSKeychainCookieStore,
+    NapCatCookieStore,
+    QzoneDirectTransport,
+)
+from .comment_workflow import (
+    CommentReplyDraftStore,
+    CommentReplyWorkflow,
+    ReplyDraftInvalidated,
+    normalize_comment_thread,
+)
 from .core import (
     DraftLockedError,
     DraftStore,
@@ -34,23 +54,31 @@ from .core import (
     confirmation_code_for_draft,
     source_fingerprint,
 )
-from .memory_sync import MemorySyncBlocked, QzoneMemoryOutbox, sync_published_post
-from .comment_reader import QzoneCommentReadError, QzoneCommentReader, QzoneCommentReplySender
-from .comment_reply import CommentReplyReceipts
-from .comment_transport import MacOSKeychainCookieStore, QzoneDirectTransport
-from .comment_workflow import CommentReplyDraftStore, CommentReplyWorkflow, ReplyDraftInvalidated, normalize_comment_thread
 from .image_assets import (
     generate_qzone_camera_asset,
     stage_camera_image,
     verify_staged_image,
 )
+from .memory_sync import MemorySyncBlocked, QzoneMemoryOutbox, sync_published_post
 from .source_adapter import VirtualLifeSourceAdapter
 from .weekly_schedule import WeeklyScheduleStore
 
-AUTO_TARGET_USER = "100000001"
-AUTO_TARGET_UMO = "qq_napcat_100000002:FriendMessage:100000001"
-COMMENT_BOT_ACCOUNT_UIN = "100000002"
-COMMENT_OWNER_ACTOR_UIN = "100000001"
+# 2026-10-17：公开仓库只保留占位符。真实部署值放在 **不入库** 的
+# ``local_deployment.py``（见同目录 .gitignore 与 07_脚本与工具/sync_project_to_github.sh）。
+# 该文件缺失时回退到占位符，等于闸门全关（自动发布/评论回复都不会启动），
+# 而不是猜一个号——这是失败安全的方向。
+try:  # pragma: no cover - 部署相关，跑测试走回退分支
+    from .local_deployment import (  # type: ignore[attr-defined]
+        AUTO_TARGET_UMO,
+        AUTO_TARGET_USER,
+        COMMENT_BOT_ACCOUNT_UIN,
+        COMMENT_OWNER_ACTOR_UIN,
+    )
+except ImportError:
+    AUTO_TARGET_USER = "100000001"
+    AUTO_TARGET_UMO = "qq_napcat_100000002:FriendMessage:100000001"
+    COMMENT_BOT_ACCOUNT_UIN = "100000002"
+    COMMENT_OWNER_ACTOR_UIN = "100000001"
 
 
 class QzoneDynamicsPlugin(Star):
@@ -92,9 +120,31 @@ class QzoneDynamicsPlugin(Star):
         )
         self.text_generator = text_generator or AstrBotTextGenerationAdapter(context)
         self._source_locks: dict[str, asyncio.Lock] = {}
-        self._auto_schedule = WeeklyScheduleStore(data_dir / "weekly_publish_state.json")
+        try:
+            daily_probability = float(config.get("auto_publish_daily_probability", 0.5))
+        except (TypeError, ValueError):
+            daily_probability = 0.5
+        self._auto_schedule = WeeklyScheduleStore(
+            data_dir / "weekly_publish_state.json",
+            daily_probability=daily_probability,
+        )
+        try:
+            image_probability = float(
+                config.get("auto_publish_image_probability", 0.45)
+            )
+        except (TypeError, ValueError):
+            image_probability = 0.45
+        self._auto_image_quota = AutoImageQuota(
+            data_dir / "auto_image_state.json",
+            probability=image_probability,
+        )
         self._auto_task: asyncio.Task | None = None
         self._memory_sync_task: asyncio.Task | None = None
+        self._auto_comment_task: asyncio.Task | None = None
+        self._auto_comments = AutoCommentReplies(
+            data_dir / "auto_comment_state.json",
+            account_uin=COMMENT_BOT_ACCOUNT_UIN, owner_uin=COMMENT_OWNER_ACTOR_UIN,
+        )
 
     async def _reserve_primary_source(self, source: SafeDraftInput) -> SafeDraftInput:
         """Reserve one optional primary material; persona/time stay shared base context."""
@@ -182,7 +232,9 @@ class QzoneDynamicsPlugin(Star):
             and str(self.config.get("publish_ugc_right", "")) == "4"
             and isinstance(targets, (list, tuple))
             and len(targets) == 0
-            and not bool(self.config.get("image_enabled", False))
+            # 2026-10-20：图片开关不再关掉自动发布。带图是否发生由
+            # auto_publish_image_enabled + 45% 抽签 + 48h 配额另行决定；
+            # 没中/配额未到都退回纯文字，不会挡住发帖。
             and not bool(self.config.get("include_mood", False))
             and self.config.get("text_backend_mode", "astrbot_provider") == "astrbot_provider"
             and str(self.config.get("authorized_user_qq", "") or "").strip() == AUTO_TARGET_USER
@@ -198,9 +250,21 @@ class QzoneDynamicsPlugin(Star):
             self._auto_task is None or self._auto_task.done()
         ):
             self._auto_task = asyncio.create_task(self._auto_publish_loop())
+        if self._auto_comment_ready() and (
+            self._auto_comment_task is None or self._auto_comment_task.done()
+        ):
+            self._auto_comment_task = asyncio.create_task(self._auto_comment_loop())
 
     async def terminate(self):
         """Stop the scheduler; any persisted running slot is consumed as unknown on restart."""
+        comment_task = self._auto_comment_task
+        self._auto_comment_task = None
+        if comment_task is not None:
+            comment_task.cancel()
+            try:
+                await comment_task
+            except asyncio.CancelledError:
+                pass
         task = self._auto_task
         self._auto_task = None
         if task is not None:
@@ -301,25 +365,92 @@ class QzoneDynamicsPlugin(Star):
 
     @staticmethod
     def _important_date_slots(now: datetime) -> tuple[list, dict]:
-        """给周计划用的"重要日子"日期与固定时刻（限定下一个完整周）；失败返回空。
+        """给周计划用的"重要日子"日期与固定时刻（本周 + 下周）；失败返回空。
 
-        2026-10-16：让周计划把 5 个槽中的一个钉在重要日子上（槽数不变）；
-        若该日子填了"当天几点发"，则那个槽用它指定的时刻。
+        2026-10-16：让周计划把槽位钉在重要日子上，并支持"当天几点发"。
+        2026-10-19：改为抽签式后，重要日子必须 **100% 有槽**——同时覆盖
+        本周和下周（首次生成的计划是下周，日常维护的是本周），由
+        `_reconcile_special_slots` 只取属于计划那一周的日子。
         """
         try:
             try:
                 from data.plugins.important_dates import day_times, days_with_events
             except ImportError:  # pragma: no cover
                 from important_dates import day_times, days_with_events  # type: ignore
-            from .weekly_schedule import next_full_week
+            from .weekly_schedule import week_monday
 
-            monday = next_full_week(now)
-            sunday = monday + timedelta(days=6)
+            monday = week_monday(now.astimezone(ZoneInfo("Asia/Shanghai")).date())
+            sunday = monday + timedelta(days=13)
             dates = days_with_events(monday, sunday, channel="qzone")
             times = day_times(monday, sunday, channel="qzone")
             return dates, times
         except Exception:
             return [], {}
+
+    def _auto_image_allowed(self) -> bool:
+        """Auto images need both the image master switch and their own opt-in."""
+        return bool(self.config.get("image_enabled", False)) and bool(
+            self.config.get("auto_publish_image_enabled", False)
+        )
+
+    async def _prepare_auto_image(self, draft: object, now: datetime) -> tuple[str, str]:
+        """Try to attach one camera image; every failure falls back to text only.
+
+        Returns:
+            ``(file_uri, claim_token)``; either may be empty when no image is used.
+        """
+        try:
+            if not self._auto_image_quota.roll_for_day(now.date()):
+                logger.info(
+                    "[qzone] 今日配图抽签: no（概率 %.0f%%）",
+                    self._auto_image_quota.probability * 100,
+                )
+                return "", ""
+        except AutoImageStoreUnavailable:
+            logger.warning("[qzone] auto image roll unavailable; text-only fallback")
+            return "", ""
+        logger.info(
+            "[qzone] 今日配图抽签: yes（概率 %.0f%%）",
+            self._auto_image_quota.probability * 100,
+        )
+        camera = self._get_camera_generator()
+        if camera is None:
+            return "", ""
+        token = uuid.uuid4().hex
+        try:
+            decision = self._auto_image_quota.reserve(
+                token, str(getattr(draft, "draft_id", "")), now
+            )
+        except AutoImageStoreUnavailable:
+            logger.warning("[qzone] auto image quota unavailable; text-only fallback")
+            return "", ""
+        status = str(decision.get("status", ""))
+        if status != "reserved":
+            logger.info("[qzone] auto image skipped | quota=%s", status or "unknown")
+            return "", ""
+        try:
+            image_uri = await generate_qzone_camera_asset(
+                camera, str(getattr(draft, "content", "")), self._image_asset_dir
+            )
+        except Exception as exc:
+            # The paid camera may have already run; never retry it automatically.
+            try:
+                self._auto_image_quota.mark_unknown(token)
+            except AutoImageStoreUnavailable:
+                pass
+            logger.warning(
+                "[qzone] auto image generation unresolved; text-only fallback | exception=%s",
+                type(exc).__name__,
+            )
+            return "", ""
+        try:
+            self._auto_image_quota.mark_ready(token, image_uri, now)
+        except AutoImageStoreUnavailable:
+            # The image exists; only the quota bookkeeping failed. Attaching it
+            # is still safe, and the stale reservation is dropped on expiry.
+            pass
+        logger.info("[qzone] auto image staged | draft=%s", getattr(draft, "draft_id", ""))
+        return image_uri, token
 
     async def _auto_publish_tick(self):
         now = datetime.now(ZoneInfo("Asia/Shanghai"))
@@ -331,6 +462,7 @@ class QzoneDynamicsPlugin(Star):
             return
         result, draft_id, remote_tid = "skipped", "", ""
         material_token = ""
+        image_token = ""
         try:
             # Exact scope guard is repeated at execution time in case config changed.
             if not self._auto_publish_ready():
@@ -356,6 +488,18 @@ class QzoneDynamicsPlugin(Star):
                 # Keep the pending draft and lease available for explicit human
                 # review. Never auto-approve or publish this source.
                 return
+            if self._auto_image_allowed():
+                image_uri, image_token = await self._prepare_auto_image(draft, now)
+                if image_uri:
+                    try:
+                        # set_images 会撤销旧审核；必须紧接着重新审核。
+                        draft = self.store.set_images(draft.draft_id, (image_uri,))
+                    except Exception:
+                        # The image exists but cannot be bound; free the claim so
+                        # the next slot can try again instead of quarantining.
+                        self._auto_image_quota.release(image_token)
+                        image_token = ""
+                        raise
             reviewed = approve_draft(
                 self.store,
                 draft_id,
@@ -370,7 +514,22 @@ class QzoneDynamicsPlugin(Star):
             platform = platform_getter(platform_id) if callable(platform_getter) else None
             client_getter = getattr(platform, "get_client", None)
             action_client = client_getter() if callable(client_getter) else None
-            publisher = NapCatQzonePublisher(action_client)
+            if reviewed.image_files and any(
+                not verify_staged_image(uri, self._image_asset_dir)
+                for uri in reviewed.image_files
+            ):
+                # 图片本体已被动过或丢失：退回纯文字，绝不发一个坏引用。
+                if image_token:
+                    self._auto_image_quota.release(image_token)
+                    image_token = ""
+                self.store.set_images(draft_id, ())
+                reviewed = approve_draft(
+                    self.store, draft_id, ugc_right=4, target_uins=()
+                )
+            has_image = bool(reviewed.image_files)
+            publisher = NapCatQzonePublisher(
+                action_client, image_enabled=has_image
+            )
             service = PublicationService(self.store, publisher)
             sent = await service.publish_once(
                 draft_id,
@@ -378,11 +537,19 @@ class QzoneDynamicsPlugin(Star):
                 ugc_right=4,
                 target_uins=(),
                 confirmation_token=confirmation_code_for_draft(reviewed, 4, ()),
-                images=(),
-                image_enabled=False,
+                images=reviewed.image_files,
+                image_enabled=has_image,
             )
             result = sent.status
             remote_tid = sent.remote_tid
+            if image_token:
+                if sent.status in {"published", "delivery_unknown"}:
+                    # delivery_unknown 也按“已消耗配额”处理：宁可 48 小时
+                    # 不出图，也不要重复付费重拍。
+                    self._auto_image_quota.mark_success(now)
+                else:
+                    self._auto_image_quota.release(image_token)
+                image_token = ""
             if material_token:
                 self._finish_material_reservation(material_token, sent.status)
                 material_token = ""
@@ -437,6 +604,71 @@ class QzoneDynamicsPlugin(Star):
         if not for_sync and self.config.get("comment_reply_enabled", False) is not True:
             return False, "手动评论回复功能当前关闭。"
         return True, ""
+
+    def _auto_comment_ready(self):
+        """Require explicit opt-in and the exact deployed owner/account scope."""
+        return (
+            self.config.get("enabled", False) is True
+            and self.config.get("comment_auto_reply_enabled", False) is True
+            and str(self.config.get("authorized_user_qq", "")) == COMMENT_OWNER_ACTOR_UIN
+            and str(self.config.get("authorized_umo", "")) == AUTO_TARGET_UMO
+            and str(self.config.get("bot_account_uin", "")) == COMMENT_BOT_ACCOUNT_UIN
+        )
+
+    async def _auto_comment_loop(self):
+        """Poll only plugin-published posts and never catch up old comments."""
+        await asyncio.sleep(30)
+        while self._auto_comment_ready():
+            try:
+                workflow = self._comment_reply_workflow(enabled=True, umo=AUTO_TARGET_UMO)
+                posts = sorted(
+                    (d for d in self.store.list() if d.status == "published" and d.remote_tid),
+                    key=lambda d: d.published_at or d.created_at, reverse=True,
+                )[:10]
+                for draft in posts:
+                    status = await self._auto_comments.poll_post(
+                        workflow, draft.remote_tid, ready=self._auto_comment_ready,
+                    )
+                    if status != "idle":
+                        logger.info("[QzoneComments] post=%s status=%s", draft.remote_tid, status)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Never log the credential, returned body, comment or persona.
+                reason = getattr(exc, "code", None)
+                logger.warning("[QzoneComments] poll deferred (%s)", reason or type(exc).__name__)
+                await asyncio.sleep(240)
+            await asyncio.sleep(60)
+
+    @qzone_group.command("评论检查")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def inspect_comments(self, event: AstrMessageEvent, post_id: str):
+        """Check credentials and thread completeness without generation or sending."""
+        allowed, reason = self._comment_command_ready(event, for_sync=True)
+        if not allowed:
+            yield event.plain_result(reason)
+            return
+        if not any(d.status == "published" and d.remote_tid == post_id for d in self.store.list()):
+            yield event.plain_result("请选本插件已经发表成功的动态。")
+            return
+        try:
+            workflow = self._comment_reply_workflow(enabled=True, umo=str(event.unified_msg_origin))
+            snapshot = normalize_comment_thread(await workflow.thread_loader(COMMENT_BOT_ACCOUNT_UIN, post_id))
+            count = sum(c.author_uin == COMMENT_OWNER_ACTOR_UIN for c in snapshot["comments"])
+            baseline_ready = post_id in self._auto_comments._load()["posts"]
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if not code:
+                code = str(exc) if re.fullmatch(r"qzone_[a-z_]+", str(exc)) else type(exc).__name__
+            yield event.plain_result(f"评论读取尚未通过（{code}）；没有生成或发送回复。")
+            return
+        yield event.plain_result(
+            f"评论读取通过：完整线程 {snapshot['declared_comment_count']} 条，其中你的评论 {count} 条。"
+            "本次没有生成或发送回复；"
+            + ("基线已建立，可以新增一条主评论测试自动回复。"
+               if baseline_ready
+               else "基线尚未建立，请等约一分钟再检查；之后新增主评论测试。")
+        )
 
     @qzone_group.command("同步评论")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -641,11 +873,16 @@ class QzoneDynamicsPlugin(Star):
         if (owner_actor_uin != COMMENT_OWNER_ACTOR_UIN or bot_account_uin != COMMENT_BOT_ACCOUNT_UIN
                 or umo != AUTO_TARGET_UMO):
             raise ValueError("comment_account_scope_not_authorized")
-        cookie_store = MacOSKeychainCookieStore(bot_account_uin)
+        platform = self.context.get_platform_inst(umo.split(":", 1)[0])
+        client = platform.get_client() if platform and callable(getattr(platform, "get_client", None)) else None
+        cookie_store = (NapCatCookieStore(bot_account_uin, client) if client is not None
+                        else MacOSKeychainCookieStore(bot_account_uin))
         transport = QzoneDirectTransport(cookie_store, enabled=enabled)
         max_comments = self.config.get("comment_max_comments", 20)
         reader = QzoneCommentReader(transport, max_comments=max_comments)
         sender = QzoneCommentReplySender(transport, owner_actor_uin=owner_actor_uin)
+
+        thread_context = ""
 
         async def observed_thread_loader(account_uin, post_id):
             """Observe only the existing authorized complete-thread read.
@@ -664,6 +901,13 @@ class QzoneDynamicsPlugin(Star):
                 logger.warning("[qzone] local memory outbox unavailable (%s)", type(exc).__name__)
             raw = await reader.load_full_thread(account_uin, post_id)
             snapshot = normalize_comment_thread(raw)
+            nonlocal thread_context
+            thread_context = json.dumps([
+                {"author": ("小回" if c.author_uin == bot_account_uin else
+                            "主人" if c.author_uin == owner_actor_uin else "其他评论者"),
+                 "content": c.content, "id": c.comment_id, "parent": c.parent_comment_id}
+                for c in snapshot["comments"]
+            ], ensure_ascii=False)
             try:
                 if revision is not None and self._comment_memory_outbox.observe(snapshot, revision):
                     await self._comment_memory_outbox.flush(self.context, post_id)
@@ -682,9 +926,9 @@ class QzoneDynamicsPlugin(Star):
             self._comment_memory_outbox.record_sent(target, content, result)
             await self._comment_memory_outbox.flush(self.context, target.post_id)
 
-        async def draft_generator(comment, post_content):
+        async def draft_generator(comment, post_content, *, thread_context=""):
             return await self.text_generator.generate_comment_reply(
-                comment, post_content, umo=umo
+                comment, post_content, umo=umo, thread_context=thread_context,
             )
 
         return CommentReplyWorkflow(
@@ -769,7 +1013,8 @@ class QzoneDynamicsPlugin(Star):
         previous_token = previous.material_reservation_token if previous else ""
         try:
             source = await self._reserve_primary_source(source)
-        except Exception:
+        except Exception as exc:
+            logger.warning("[QzoneDynamics] 共享素材协调失败：%r", exc)
             yield event.plain_result("共享素材协调暂不可用；为避免两端重复选材，未生成草稿。")
             return
         new_token = source.source_reservation_token
@@ -793,10 +1038,15 @@ class QzoneDynamicsPlugin(Star):
                 self.source_ledger.finish(new_token, published=False)
             yield event.plain_result(f"未生成草稿：{exc}")
             return
-        except Exception:
+        except Exception as exc:
             if new_token:
                 self.source_ledger.finish(new_token, published=False)
-            yield event.plain_result("未生成草稿：文字 provider 请求失败；没有模板回退。")
+            logger.warning(
+                "[QzoneDynamics] 生成草稿失败：%s: %s", type(exc).__name__, exc
+            )
+            yield event.plain_result(
+                f"未生成草稿：文字 provider 请求失败（{type(exc).__name__}）；没有模板回退。"
+            )
             return
         if previous_token and previous_token != draft.material_reservation_token:
             self.source_ledger.finish(previous_token, published=False)

@@ -289,12 +289,36 @@ class QzoneCommentReader:
         detail_tid = _exact_post_id(detail.get("tid"), "comment_detail_identity_missing")
         if detail_uin != owner or detail_tid != post:
             raise QzoneCommentReadError("comment_detail_identity_mismatch")
-        rows = _container(detail, "commentlist")
+        # Real QQ omits commentlist entirely on a verified zero-comment post.
+        # cmtnum counts ROOTS, not the full flattened thread (including list_3).
+        native_roots = None
+        if "cmtnum" in feed_post and "cmtnum" in detail:
+            feed_roots = int(_exact_decimal_id(feed_post["cmtnum"], "comment_count_invalid"))
+            native_roots = int(_exact_decimal_id(detail["cmtnum"], "comment_count_invalid"))
+            if feed_roots != native_roots:
+                raise QzoneCommentReadError("comment_count_conflict")
+        nested_detail = detail.get("data")
+        has_rows = "commentlist" in detail or (
+            isinstance(nested_detail, Mapping) and "commentlist" in nested_detail
+        )
+        rows = [] if native_roots == 0 and not has_rows else _container(detail, "commentlist")
         comments = flatten_detail_comments(rows)
         evidence = {
             **_server_count_evidence(feed_post, "feed"),
             **_server_count_evidence(detail, "detail"),
         }
+        if native_roots is not None:
+            if native_roots != len(rows):
+                raise QzoneCommentReadError("comment_thread_truncated")
+            child_total = 0
+            for row in rows:
+                if "replyNum" not in row:
+                    raise QzoneCommentReadError("comment_thread_completeness_unknown")
+                replies = int(_exact_decimal_id(row["replyNum"], "comment_count_invalid"))
+                if replies != len(row.get("list_3", [])):
+                    raise QzoneCommentReadError("comment_replies_incomplete")
+                child_total += replies
+            evidence["detail.cmtnum+sum(commentlist.replyNum)"] = native_roots + child_total
         if not evidence:
             raise QzoneCommentReadError("comment_thread_completeness_unknown")
         counts = list(evidence.values())
@@ -341,7 +365,9 @@ class QzoneCommentReplySender:
             post_author_uin=target.account_uin,
             post_id=target.post_id,
             content=content,
-            comment_id=target.parent_comment_id,
+            # QQ空间楼层是两层结构：即使回复楼内追问，接口也只认主评论 ID；
+            # 具体回复谁由 commentUin 决定。
+            comment_id=target.thread_root_comment_id or target.parent_comment_id,
             comment_uin=target.target_uin,
         )
         body = await self.transport.request(

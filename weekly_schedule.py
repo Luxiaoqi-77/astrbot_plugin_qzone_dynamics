@@ -11,12 +11,22 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 # 2026-10-16 主人要求：QQ空间改为"每天一条"（原为 5 条/周）。
 SLOT_COUNT = 7
 GRACE = timedelta(minutes=10)
 MIN_SLOT_GAP = timedelta(hours=18)
+# 2026-10-19：主人嫌"每天一条太多"→ 改成每天抽签，默认 50%；
+# 命中"重要日子"（qzone 渠道）的日子 100% 发。
+DEFAULT_DAILY_PROBABILITY = 0.5
+
+
+def _clamp_probability(value) -> float:
+    try:
+        probability = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_PROBABILITY
+    return min(1.0, max(0.0, probability))
 
 
 def week_monday(day: date) -> date:
@@ -49,35 +59,54 @@ def make_week_plan(
     rng: random.Random | None = None,
     special_dates=None,
     special_times=None,
+    daily_probability=DEFAULT_DAILY_PROBABILITY,
 ) -> dict[str, object]:
-    """每天一个槽位（09:00–21:59 内随机）。
+    """每天按概率抽签决定要不要发（09:00–21:59 内随机时刻）。
 
     2026-10-16：主人要求改为"每天一条"（原为每周 5 个随机槽、≥18h 间隔）。
-    现在每天都有槽位；重要日子不再需要"钉槽位"，只需用 special_times 指定当天时刻
-    （不指定就随机）；内容层由今天有没有重要日子决定主题。
+    2026-10-19：主人嫌每天一条太多 → 普通日子按 daily_probability（默认 50%）
+    决定当天发不发；命中"重要日子"（qzone 渠道）的日子 **100% 发**，
+    可用 special_times 指定当天时刻（不指定就随机）。
     """
     if monday.weekday() != 0:
         raise ValueError("week plan must start on Monday")
     chooser = rng or random.SystemRandom()
     times_map = special_times if isinstance(special_times, dict) else {}
-    moments = []
-    for day in range(7):
-        forced = _normalize_special_time(times_map.get((monday + timedelta(days=day)).isoformat()))
-        minute = forced if forced is not None else chooser.randrange(9 * 60, 22 * 60)
-        moments.append(datetime.combine(monday + timedelta(days=day), time(minute // 60, minute % 60), SHANGHAI))
-    selected = moments
+    probability = _clamp_probability(daily_probability)
+    specials = {
+        day for day in (special_dates or []) if isinstance(day, date)
+    }
     slots = []
-    for local in selected:
+    for day in range(7):
+        target = monday + timedelta(days=day)
+        forced = _normalize_special_time(times_map.get(target.isoformat()))
+        is_special = target in specials
+        if not is_special and chooser.random() >= probability:
+            continue
+        minute = forced if forced is not None else chooser.randrange(9 * 60, 22 * 60)
+        local = datetime.combine(target, time(minute // 60, minute % 60), SHANGHAI)
         slots.append({"id": uuid.uuid4().hex, "at": local.isoformat(), "status": "pending"})
-    return {"schema_version": 1, "week_start": monday.isoformat(), "slots": slots}
+    return {
+        "schema_version": 1,
+        "week_start": monday.isoformat(),
+        "daily_probability": probability,
+        "slots": slots,
+    }
 
 
 class WeeklyScheduleStore:
     """Atomic persistent slot state. A claimed slot is never claimed twice."""
 
-    def __init__(self, path: Path, *, rng: random.Random | None = None):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        rng: random.Random | None = None,
+        daily_probability=DEFAULT_DAILY_PROBABILITY,
+    ):
         self.path = Path(path)
         self.rng = rng
+        self.daily_probability = _clamp_probability(daily_probability)
         self.owner_id = uuid.uuid4().hex
         self.lock = threading.RLock()
 
@@ -88,9 +117,9 @@ class WeeklyScheduleStore:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("weekly publish state is unreadable") from exc
+        # 2026-10-19：抽签式下整周 0 条是合法计划（不能因为空 slots 判成损坏）
         if (not isinstance(value, dict) or value.get("schema_version") != 1
-                or not isinstance(value.get("slots"), list)
-                or len(value["slots"]) < 1):
+                or not isinstance(value.get("slots"), list)):
             raise ValueError("weekly publish state has an invalid shape")
         for slot in value["slots"]:
             if (not isinstance(slot, dict) or not isinstance(slot.get("id"), str)
@@ -154,6 +183,46 @@ class WeeklyScheduleStore:
                 break
         return changed
 
+    def _migrate_to_probability(self, plan: dict, special_dates, probability: float) -> bool:
+        """旧计划（每天都有槽位）→ 按概率抽一次签；只动"待发"槽位，返回是否有改动。
+
+        2026-10-19 改版前生成的计划每天一个槽；升级后若不作废，仍会天天发。
+        这里一次性给"未执行"的槽位抽签：特殊日子保留，普通日子按概率保留/跳过。
+        抽完写入 `daily_probability` 标记，之后不再重抽（重启也不会反复改变计划）。
+        """
+        if "daily_probability" in plan:
+            return False
+        try:
+            week = date.fromisoformat(str(plan.get("week_start")))
+        except (KeyError, ValueError):
+            return False
+        specials = {day for day in (special_dates or []) if isinstance(day, date)}
+        chooser = self.rng or random.SystemRandom()
+        decided: set[date] = set()
+        for slot in plan.get("slots", []):
+            if not isinstance(slot, dict) or slot.get("status") != "pending":
+                continue
+            local = self._slot_local(slot)
+            if local is None:
+                continue
+            day = local.date()
+            if not (week <= day <= week + timedelta(days=6)):
+                continue
+            # 特殊日子 100% 保留（多出来的同日待发槽位也作废，保证一天一条）
+            if day in specials and day not in decided:
+                decided.add(day)
+                continue
+            if day in decided:
+                slot["status"] = "consumed"
+                slot["result"] = "probability_skip"
+                continue
+            decided.add(day)
+            if chooser.random() >= probability:
+                slot["status"] = "consumed"
+                slot["result"] = "probability_skip"
+        plan["daily_probability"] = probability
+        return True
+
     def ensure_plan(self, now: datetime, *, special_dates=None, special_times=None) -> dict[str, object]:
         with self.lock:
             current = self._read()
@@ -164,8 +233,14 @@ class WeeklyScheduleStore:
                 except (KeyError, ValueError) as exc:
                     raise ValueError("weekly publish state has an invalid week") from exc
                 if saved_week >= current_week:
-                    # 计划已覆盖本周（或更远）：就地补齐缺失的重要日子槽位
+                    # 旧版"每天一条"计划 → 先一次性按抽签概率瘦身
+                    changed = self._migrate_to_probability(
+                        current, special_dates, self.daily_probability
+                    )
+                    # 就地补齐缺失的重要日子槽位
                     if self._reconcile_special_slots(current, special_dates, special_times):
+                        changed = True
+                    if changed:
                         self._write(current)
                     return current
                 # 旧计划已过期（覆盖的是更早的周）→ 补**当前这一周**，
@@ -175,6 +250,7 @@ class WeeklyScheduleStore:
                     rng=self.rng,
                     special_dates=special_dates,
                     special_times=special_times,
+                    daily_probability=self.daily_probability,
                 )
                 self._write(plan)
                 return plan
@@ -184,6 +260,7 @@ class WeeklyScheduleStore:
                 rng=self.rng,
                 special_dates=special_dates,
                 special_times=special_times,
+                daily_probability=self.daily_probability,
             )
             self._write(plan)
             return plan

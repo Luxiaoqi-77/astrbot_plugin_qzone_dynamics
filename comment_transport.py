@@ -8,13 +8,13 @@ comment switch, exact private UMO, admin permission, and one-use confirmation.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import subprocess
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Callable, Mapping
 
 from .comment_reply import normalize_post_id
-
 
 KEYCHAIN_SERVICE = "com.astrbot.qzone-dynamics.qzone-cookie"
 ALLOWED_QQ_HOSTS = frozenset(
@@ -288,6 +288,42 @@ def build_pc_comment_request(
     )
 
 
+class NapCatCookieStore:
+    """Use the connected QQ account's Qzone credential in memory only."""
+
+    def __init__(self, account_uin: str, client):
+        self.account_uin = account_uin
+        self.client = client
+
+    async def load_cookie(self) -> str:
+        """Check the active account before requesting its Qzone Cookie.
+
+        Returns:
+            An in-memory, account-checked credential.
+
+        Raises:
+            CommentTransportBlocked: If login identity or credential is unavailable.
+        """
+        try:
+            login = await self.client.call_action("get_login_info")
+            login = login.get("data", login)
+            if str(login.get("user_id", "")) != self.account_uin:
+                raise CommentTransportBlocked("qzone_credential_account_mismatch")
+            response = await self.client.call_action("get_cookies", domain="qzone.qq.com")
+            response = response.get("data", response)
+            cookie = response.get("cookies", "")
+            if (not isinstance(cookie, str) or not cookie or len(cookie) > MAX_COOKIE_CHARS
+                    or any(ord(c) < 32 or ord(c) == 127 for c in cookie)):
+                raise CommentTransportBlocked("qzone_credential_invalid")
+            _validate_cookie_account(cookie, self.account_uin)
+            _gtk_from_cookie(cookie)
+            return cookie
+        except CommentTransportBlocked:
+            raise
+        except Exception:
+            raise CommentTransportBlocked("qzone_credential_unavailable") from None
+
+
 class MacOSKeychainCookieStore:
     """Read only a Cookie entered by the user into macOS Keychain.
 
@@ -373,6 +409,8 @@ class QzoneDirectTransport:
         if endpoint.method == "POST" and params is not None:
             raise CommentTransportBlocked("qzone_endpoint_arguments_invalid")
         cookie = self.credential_store.load_cookie()
+        if inspect.isawaitable(cookie):
+            cookie = await cookie
         _validate_cookie_account(cookie, self.credential_store.account_uin)
         query_values = dict(query if query is not None else params or {})
         if endpoint_key in GTK_ENDPOINT_KEYS:

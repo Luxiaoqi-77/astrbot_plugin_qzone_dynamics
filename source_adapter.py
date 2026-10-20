@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import inspect
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import SafeDraftInput, clean_source_text

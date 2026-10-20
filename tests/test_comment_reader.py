@@ -31,7 +31,9 @@ class SyntheticTransport:
         }
         self.calls: list[tuple[str, dict[str, str]]] = []
 
-    async def request(self, endpoint_key: str, *, query: dict[str, str], **kwargs) -> bytes:
+    async def request(
+        self, endpoint_key: str, *, query: dict[str, str], **kwargs
+    ) -> bytes:
         self.calls.append((endpoint_key, dict(query)))
         return self.responses[endpoint_key]
 
@@ -166,3 +168,84 @@ class QzoneCommentReaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NativeQzoneCounterTests(unittest.TestCase):
+    """Native root and per-root child counts are different from thread totals."""
+
+    def transport(self, *, roots=1, children=0, listed_children=None):
+        feed = {
+            "code": 0,
+            "msglist": [
+                {"tid": POST_ID, "uin": BOT_UIN, "content": "合成动态", "cmtnum": roots}
+            ],
+        }
+        detail = {"code": 0, "uin": BOT_UIN, "tid": POST_ID, "cmtnum": roots}
+        if roots:
+            detail["commentlist"] = [
+                {
+                    "tid": "1",
+                    "uin": OWNER_UIN,
+                    "content": "合成评论",
+                    "replyNum": children,
+                }
+            ]
+            if children or listed_children is not None:
+                count = children if listed_children is None else listed_children
+                detail["commentlist"][0]["list_3"] = [
+                    {"tid": str(i + 10), "uin": BOT_UIN, "content": "合成回复"}
+                    for i in range(count)
+                ]
+        return SyntheticTransport(feed, detail)
+
+    def test_native_zero_roots_may_omit_commentlist(self):
+        result = asyncio.run(
+            QzoneCommentReader(self.transport(roots=0)).load_full_thread(
+                BOT_UIN, POST_ID
+            )
+        )
+        self.assertEqual(result["declared_comment_count"], 0)
+        self.assertEqual(result["comments"], [])
+
+    def test_native_root_without_replies(self):
+        result = asyncio.run(
+            QzoneCommentReader(self.transport()).load_full_thread(BOT_UIN, POST_ID)
+        )
+        self.assertEqual(result["declared_comment_count"], 1)
+
+    def test_native_child_count_is_added_to_root_count(self):
+        result = asyncio.run(
+            QzoneCommentReader(self.transport(children=1)).load_full_thread(
+                BOT_UIN, POST_ID
+            )
+        )
+        self.assertEqual(result["declared_comment_count"], 2)
+        self.assertEqual(len(result["comments"]), 2)
+
+    def test_native_truncated_children_rejected(self):
+        with self.assertRaises(QzoneCommentReadError):
+            asyncio.run(
+                QzoneCommentReader(
+                    self.transport(children=2, listed_children=1)
+                ).load_full_thread(BOT_UIN, POST_ID)
+            )
+
+    def test_native_missing_child_counter_rejected(self):
+        transport = self.transport()
+        detail = json.loads(transport.responses["get_post_detail"])
+        del detail["commentlist"][0]["replyNum"]
+        transport.responses["get_post_detail"] = json.dumps(detail).encode()
+        with self.assertRaises(QzoneCommentReadError):
+            asyncio.run(
+                QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+            )
+
+    def test_native_root_counts_conflict_rejected(self):
+        transport = self.transport()
+        detail = json.loads(transport.responses["get_post_detail"])
+        detail["cmtnum"] = 0
+        transport.responses["get_post_detail"] = json.dumps(detail).encode()
+        with self.assertRaises(QzoneCommentReadError):
+            asyncio.run(
+                QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+            )

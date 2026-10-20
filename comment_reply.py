@@ -10,14 +10,13 @@ import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-
 # Generic page/root counters are not evidence of a whole thread total.
 SERVER_COMMENT_TOTAL_FIELDS = ("total_comment_count", "totalCommentCount")
 SERVER_COMMENT_TOTAL_PATHS = frozenset(
     f"{source}.{field}"
     for source in ("feed", "feed.data", "detail", "detail.data")
     for field in SERVER_COMMENT_TOTAL_FIELDS
-)
+) | {"detail.cmtnum+sum(commentlist.replyNum)"}
 
 
 def normalize_post_id(value: object) -> str:
@@ -63,6 +62,28 @@ class ExactReplyTarget:
     idempotency_key: str
     parent_identity_key: str = ""
     legacy_idempotency_key: str = ""
+    # 2026-10-20：QQ空间楼层是两层结构，回复接口只认主评论 ID。
+    # 楼内追问的目标 ID 另存，发请求时用 thread_root_comment_id。
+    thread_root_comment_id: str = ""
+
+
+_QZONE_MENTION = re.compile(r"@\{uin:\d+,nick:([^,}]*),who:\d+,auto:\d+\}")
+
+
+def clean_comment_text(text: str) -> str:
+    """Replace Qzone's raw @{uin:...,nick:...} markup with a readable mention."""
+    cleaned = _QZONE_MENTION.sub(
+        lambda match: f"@{match.group(1)}" if match.group(1) else "", str(text or "")
+    )
+    return " ".join(cleaned.split())
+
+
+def strip_trailing_period(text: str) -> str:
+    """Drop terminal sentence periods (主人 2026-10-20：评论回复不要用句号收尾)."""
+    cleaned = str(text or "").rstrip()
+    while cleaned and cleaned[-1] in "。．.·":
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
 
 
 def comment_identity_key(comment_id: str, parent_comment_id: str = "") -> str:
@@ -84,6 +105,7 @@ def bind_reply_target(
     expected_target_uin: str,
     declared_comment_count: int,
     comments: tuple[VerifiedComment, ...] | list[VerifiedComment],
+    comment_parent_id: str = "",
 ) -> ExactReplyTarget:
     """Bind a verified exact target and fingerprint the full selected context.
 
@@ -96,6 +118,8 @@ def bind_reply_target(
         expected_target_uin: Verified selected comment author.
         declared_comment_count: Explicit server total including replies.
         comments: Normalized complete comment rows with exact parent IDs.
+        comment_parent_id: Optional exact parent of the selected comment, used
+            only to disambiguate duplicate raw IDs across nesting levels.
 
     Returns:
         One target with stable context and permanent idempotency fingerprints.
@@ -125,24 +149,54 @@ def bind_reply_target(
     ]
     if len(set(identity_values)) != len(identity_values):
         raise ValueError("same-level comment identities are duplicated")
-    matches = [
-        comment
-        for comment in comments
-        if comment.comment_id == comment_id and not comment.parent_comment_id
-    ]
+    matches = [comment for comment in comments if comment.comment_id == comment_id]
+    if comment_parent_id:
+        matches = [
+            comment
+            for comment in matches
+            if comment.parent_comment_id == comment_parent_id
+        ]
     if len(matches) != 1:
         raise ValueError("the exact comment ID must match one thread row")
     target = matches[0]
     if not target.content.strip() or target.author_uin != expected_target_uin:
         raise ValueError("the expected user does not own the exact comment")
     if target.parent_comment_id:
+        # 2026-10-20：楼内追问也允许作回复目标；父评论可以是顶层，也可以是
+        # 上一层的回复。QQ真实数据里回复会复用主评论 ID，父 ID 先按顶层解析。
         parent_matches = [
-            item
-            for item in comments
-            if item.comment_id == target.parent_comment_id and not item.parent_comment_id
+            item for item in comments if item.comment_id == target.parent_comment_id
         ]
-        if len(parent_matches) != 1:
+        top_level_parents = [
+            item for item in parent_matches if not item.parent_comment_id
+        ]
+        if len(top_level_parents) == 1:
+            pass
+        elif len(parent_matches) != 1:
             raise ValueError("the exact parent comment is missing or ambiguous")
+    root = target
+    seen_roots = {target.identity_key or comment_identity_key(target.comment_id, target.parent_comment_id)}
+    while root.parent_comment_id:
+        candidates = [
+            item for item in comments if item.comment_id == root.parent_comment_id
+        ]
+        top_level_candidates = [
+            item for item in candidates if not item.parent_comment_id
+        ]
+        parent = (
+            top_level_candidates[0]
+            if len(top_level_candidates) == 1
+            else (candidates[0] if len(candidates) == 1 else None)
+        )
+        if parent is None:
+            raise ValueError("the exact parent comment is missing or ambiguous")
+        parent_identity = parent.identity_key or comment_identity_key(
+            parent.comment_id, parent.parent_comment_id
+        )
+        if parent_identity in seen_roots:
+            raise ValueError("comment parent relationships contain a cycle")
+        seen_roots.add(parent_identity)
+        root = parent
     canonical = {
         "schema_version": 2,
         "account_uin": account_uin,
@@ -183,6 +237,7 @@ def bind_reply_target(
         idempotency_key=idempotency_key,
         parent_identity_key=target.identity_key or comment_identity_key(target.comment_id),
         legacy_idempotency_key=legacy_idempotency_key,
+        thread_root_comment_id=root.comment_id,
     )
 
 
@@ -212,6 +267,14 @@ class CommentReplyReceipts:
             encoding="utf-8",
         )
         os.replace(temporary, self.path)
+
+    def contains(self, target: ExactReplyTarget) -> bool:
+        """Check all legacy and current claim keys before generating a reply."""
+        with self.lock:
+            receipts = self._load()
+            return any(key and key in receipts for key in (
+                target.idempotency_key, target.legacy_idempotency_key,
+            ))
 
     def claim(self, target: ExactReplyTarget) -> bool:
         """Claim one reply; every prior status permanently prevents a new send."""

@@ -125,15 +125,24 @@ def normalize_comment_thread(snapshot: Mapping[str, object]) -> dict[str, object
     identities = [comment.identity_key for comment in comments]
     if len(set(identities)) != len(identities):
         raise ValueError("same-level comment identities are duplicated")
-    top_level = {
-        comment.comment_id: comment
-        for comment in comments
-        if not comment.parent_comment_id
-    }
+    # 2026-10-20：QQ空间真实返回里，楼内回复可能复用主评论的 commentid
+    # （如 top_level:1 与 reply:1:1 的 commentid 都是 1）。父 ID 先把
+    # 顶层评论作为唯一解析目标；没有顶层时才接受唯一的回复行。
+    by_id: dict[str, list[VerifiedComment]] = {}
     for comment in comments:
-        if comment.parent_comment_id and (
-            comment.parent_comment_id not in top_level
-        ):
+        by_id.setdefault(comment.comment_id, []).append(comment)
+
+    def _resolve_parent(parent_id: str) -> VerifiedComment | None:
+        candidates = by_id.get(parent_id, [])
+        top_level = [item for item in candidates if not item.parent_comment_id]
+        if len(top_level) == 1:
+            return top_level[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    for comment in comments:
+        if comment.parent_comment_id and _resolve_parent(comment.parent_comment_id) is None:
             raise ValueError("a comment has an invalid or missing exact parent ID")
     for comment in comments:
         visited: set[str] = set()
@@ -142,7 +151,10 @@ def normalize_comment_thread(snapshot: Mapping[str, object]) -> dict[str, object
             if current.identity_key in visited:
                 raise ValueError("comment parent relationships contain a cycle")
             visited.add(current.identity_key)
-            current = top_level[current.parent_comment_id]
+            parent = _resolve_parent(current.parent_comment_id)
+            if parent is None:
+                raise ValueError("a comment has an invalid or missing exact parent ID")
+            current = parent
 
     return {
         "account_uin": account_uin,
@@ -387,7 +399,15 @@ class CommentReplyWorkflow:
             declared_comment_count=snapshot["declared_comment_count"],
             comments=snapshot["comments"],
         )
-        comment = next(item for item in snapshot["comments"] if item.comment_id == exact_comment_id)
+        comment = next(
+            item
+            for item in snapshot["comments"]
+            if (
+                item.identity_key
+                or comment_identity_key(item.comment_id, item.parent_comment_id)
+            )
+            == target.parent_identity_key
+        )
         content = await self.draft_generator(comment, snapshot["post_content"])
         if not isinstance(content, str) or not content.strip() or len(content) > 1000:
             raise ValueError("generated reply draft is empty or too long")
@@ -488,6 +508,7 @@ class CommentReplyWorkflow:
             idempotency_key=draft.idempotency_key,
             parent_identity_key=current_target.parent_identity_key,
             legacy_idempotency_key=current_target.legacy_idempotency_key,
+            thread_root_comment_id=current_target.thread_root_comment_id,
         )
         # Recheck pending state and persist both claims before the external call.
         # An overlapping confirmation cannot send a draft invalidated meanwhile.

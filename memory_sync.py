@@ -10,8 +10,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-OWNER_ID = "100000001"
-ASSISTANT_ID = "100000002"
+# 2026-10-17：公开仓库只保留占位符。真实账号放在 **不入库** 的 local_deployment.py
+# （与 main.py 同一套机制）；缺失时回退占位符（= 同步闸门全关，不会猜号）。
+try:  # pragma: no cover - 部署相关，跑测试走回退分支
+    from .local_deployment import (  # type: ignore[attr-defined]
+        COMMENT_BOT_ACCOUNT_UIN,
+        COMMENT_OWNER_ACTOR_UIN,
+    )
+
+    OWNER_ID = COMMENT_OWNER_ACTOR_UIN
+    ASSISTANT_ID = COMMENT_BOT_ACCOUNT_UIN
+except ImportError:
+    OWNER_ID = "100000001"
+    ASSISTANT_ID = "100000002"
 
 
 class MemorySyncBlocked(ValueError):

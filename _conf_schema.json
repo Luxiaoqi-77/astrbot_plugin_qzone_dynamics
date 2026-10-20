@@ -15,14 +15,31 @@
     "default": ""
   },
   "auto_draft_enabled": {
-    "description": "启用每天 1 条的自动生成流程。仅配合 auto_publish_enabled 与全部安全闸门生效；默认关闭。",
+    "description": "启用每天抽签式自动生成流程（普通日子默认 50% 发 1 条）。仅配合 auto_publish_enabled 与全部安全闸门生效；默认关闭。",
     "type": "bool",
     "default": false
   },
   "auto_publish_enabled": {
-    "description": "明确启用自动好友可见纯文字发布；需插件、自动生成、publish_enabled 与公开人设审阅闸门均开启，且范围严格为好友可见。默认关闭。",
+    "description": "明确启用自动好友可见发布；需插件、自动生成、publish_enabled 与公开人设审阅闸门均开启，且范围严格为好友可见。默认关闭。是否带图另由 auto_publish_image_enabled 决定。",
     "type": "bool",
     "default": false
+  },
+  "auto_publish_daily_probability": {
+    "description": "每天发一条的概率（抽签）",
+    "type": "float",
+    "hint": "普通日子按此概率决定当天发不发：0.5 = 50% 发、50% 不发。命中「重要日子」（QQ空间渠道）的日子 100% 发，不受此限制。抽签结果随周计划落盘，重启不会重抽；修改后从下一份周计划（通常是下周）生效。",
+    "default": 0.5
+  },
+  "auto_publish_image_enabled": {
+    "description": "自动发帖时尝试带一张相机配图。需要同时开启 image_enabled；默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "auto_publish_image_probability": {
+    "description": "自动发帖时带图的概率（抽签）",
+    "hint": "0.45 = 45% 发帖带图。没抽中直接发纯文字，不占图片配额。QQ空间独立计算每 48 小时最多 1 张，不与 Moment 共用。抽签结果当天落盘，重启不重抽。",
+    "type": "float",
+    "default": 0.45
   },
   "public_profile_reviewed": {
     "description": "仅在人工审阅独立公开角色名与描述后开启；不得使用私人 persona 或聊天内容。默认关闭。",
@@ -40,12 +57,12 @@
     "default": false
   },
   "image_enabled": {
-    "description": "允许管理员为手工审核草稿附加已有相机图，或显式调用一次本地相机文件生成接口；默认关闭。不会自动生成或定时发布图片。",
+    "description": "图片总开关：允许手工给草稿附图/相机配图，也是自动发帖带图（auto_publish_image_enabled）的前提；默认关闭。",
     "type": "bool",
     "default": false
   },
   "comment_reply_enabled": {
-    "description": "允许配置所有者在精确好友私聊中手工读取一条本人动态的评论、生成候选回复并二次确认发送。社区路由未完成真实账号兼容验收；保持关闭，默认 false。",
+    "description": "允许主人在精确好友私聊中手动准备评论回复并确认发送；自动回复由独立开关控制。",
     "type": "bool",
     "default": false
   },
@@ -62,7 +79,7 @@
     "maximum": 99
   },
   "comment_auto_reply_enabled": {
-    "description": "自动生成或发送评论回复的独立开关。候选不实现自动发送；默认 false，必须保持关闭。",
+    "description": "自动回复主人在本插件最近10条已发布动态下新增的主评论；每60秒检查，首次读取只建基线。结合当前人设、评论上下文与相关星图记忆，含标点最多20字；结果未知不重发。默认关闭。",
     "type": "bool",
     "default": false
   },

@@ -7,3 +7,8 @@ temp/
 # 运行期台账（含本地动态/远端 id，不入库）
 historical_success_receipts.json
 .DS_Store
+# 2026-10-17：本机部署真值（真实 QQ 号）不入库；公开仓库只用占位符
+local_deployment.py
+local_deployment*.py
+# 内部实现计划（不入库）
+implementation_plan.md
