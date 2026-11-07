@@ -177,3 +177,10 @@ comment_max_comments: 20
 **实际部署时**请把它们改成你自己的 QQ 号和机器人 QQ 号（通常出现在
 `OWNER_UMO` / `OWNER_SENDER_ID` / `DEFAULT_OWNER_UMO` / `authorized_umo`
 等配置项，或插件的配置文件里）。
+
+
+## 2026-11-07 代码更新
+
+评论读取与回复、feeds3支持、回复目标标记及记忆同步读回验证等更新。
+
+本次 tag：`snapshot-2026-11-07`。配置中的示例账号需替换成本地目标账号。

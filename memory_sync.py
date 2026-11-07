@@ -181,34 +181,51 @@ class QzoneMemoryOutbox:
             "declared_comment_count"
         ] != len(comments):
             raise MemorySyncBlocked("complete_comment_count_required")
-        by_id = {row.comment_id: row for row in comments}
-        selected = {row.comment_id for row in comments if row.author_uin == OWNER_ID}
-        for sid in tuple(selected):
-            parent = by_id[sid].parent_comment_id
-            seen = {sid}
-            while parent in by_id and by_id[parent].author_uin in {
-                OWNER_ID,
-                ASSISTANT_ID,
-            }:
-                if parent in seen:
+        # 2026-10-31：QQ空间楼内回复可能复用主评论的 commentid（例如
+        # top_level:1 与 reply:1:1 的 commentid 都是 1）。原先用 comment_id
+        # 做选中集合和 source_id，会让根评论与回复互相覆盖/成环，星图同步
+        # 一直 MemorySyncBlocked。这里改用带父级的 identity_key 选中，
+        # 回复的 source_id 也带上父级，根评论沿用原来的 comment:<id>。
+        by_identity = {row.identity_key: row for row in comments}
+        root_by_id = {
+            row.comment_id: row for row in comments if not row.parent_comment_id
+        }
+        selected = {
+            row.identity_key for row in comments if row.author_uin == OWNER_ID
+        }
+        for identity in tuple(selected):
+            row = by_identity[identity]
+            parent_id = row.parent_comment_id
+            seen = {identity}
+            while parent_id:
+                parent = root_by_id.get(parent_id)
+                if parent is None:
+                    raise MemorySyncBlocked("parent_missing")
+                if parent.identity_key in seen:
                     raise MemorySyncBlocked("parent_cycle")
-                seen.add(parent)
-                selected.add(parent)
-                parent = by_id[parent].parent_comment_id
+                seen.add(parent.identity_key)
+                if parent.author_uin in {OWNER_ID, ASSISTANT_ID}:
+                    selected.add(parent.identity_key)
+                parent_id = parent.parent_comment_id
         changed = True
         while changed:
             changed = False
+            selected_ids = {by_identity[key].comment_id for key in selected}
             for row in comments:
                 if (
                     row.author_uin == ASSISTANT_ID
-                    and row.parent_comment_id in selected
-                    and row.comment_id not in selected
+                    and row.parent_comment_id in selected_ids
+                    and row.identity_key not in selected
                 ):
-                    selected.add(row.comment_id)
+                    selected.add(row.identity_key)
                     changed = True
         nodes = [
             {
-                "source_id": f"comment:{row.comment_id}",
+                "source_id": (
+                    f"reply:{row.parent_comment_id}:{row.comment_id}"
+                    if row.parent_comment_id
+                    else f"comment:{row.comment_id}"
+                ),
                 "remote_id": row.comment_id,
                 "parent_id": f"comment:{row.parent_comment_id}"
                 if row.parent_comment_id
@@ -221,7 +238,8 @@ class QzoneMemoryOutbox:
                 "publication_evidence": "counted_remote_thread",
             }
             for row in comments
-            if row.comment_id in selected and row.author_uin in {OWNER_ID, ASSISTANT_ID}
+            if row.identity_key in selected
+            and row.author_uin in {OWNER_ID, ASSISTANT_ID}
         ]
         post_id = snapshot["post_id"]
         with self.lock:
@@ -280,19 +298,35 @@ class QzoneMemoryOutbox:
             self._save(value)
             return True
 
-    def record_sent(self, target: Any, content: str, result: dict) -> None:
-        """Append only a business-confirmed send to its verified thread.
+    def record_sent(
+        self,
+        target: Any,
+        content: str,
+        result: dict | None,
+        *,
+        verified_by_readback: bool = False,
+    ) -> None:
+        """Append a confirmed send to its verified thread.
 
         Args:
             target: Exact confirmed owner reply target.
             content: Actual submitted reply.
-            result: Sender's real business status codes.
+            result: Sender's real business status codes, if any.
+            verified_by_readback: The exact reply was read back from the
+                complete remote thread after an ambiguous business response.
 
         Raises:
             MemorySyncBlocked: If success or owner scope cannot be verified.
         """
-        codes = [result[key] for key in ("code", "ret") if key in result]
-        if not codes or any(type(code) is not int or code != 0 for code in codes):
+        codes = (
+            [result[key] for key in ("code", "ret") if key in result]
+            if isinstance(result, dict)
+            else []
+        )
+        business_success = bool(codes) and all(
+            type(code) is int and code == 0 for code in codes
+        )
+        if not verified_by_readback and not business_success:
             raise MemorySyncBlocked("reply_not_confirmed_sent")
         if target.account_uin != ASSISTANT_ID or target.target_uin != OWNER_ID:
             raise MemorySyncBlocked("reply_owner_scope_mismatch")
@@ -309,21 +343,25 @@ class QzoneMemoryOutbox:
                 return
             value["sequence"] += 1
             payload["revision"] = value["sequence"]
-            payload["comments"].append(
-                {
-                    "source_id": sid,
-                    "remote_id": "",
-                    "parent_id": f"comment:{target.parent_comment_id}",
-                    "author_kind": "assistant",
-                    "author_id": ASSISTANT_ID,
-                    "content": content,
-                    "created_at": "",
-                    "confirmed_at": datetime.now(timezone.utc).isoformat(),
-                    "publication_state": "published",
-                    "publication_evidence": "qzone_business_success",
-                    "business_codes": codes,
-                }
-            )
+            node = {
+                "source_id": sid,
+                "remote_id": "",
+                "parent_id": f"comment:{target.parent_comment_id}",
+                "author_kind": "assistant",
+                "author_id": ASSISTANT_ID,
+                "content": content,
+                "created_at": "",
+                "confirmed_at": datetime.now(timezone.utc).isoformat(),
+                "publication_state": "published",
+                "publication_evidence": (
+                    "qzone_business_success"
+                    if business_success
+                    else "verified_remote_thread"
+                ),
+            }
+            if business_success:
+                node["business_codes"] = codes
+            payload["comments"].append(node)
             receipt["state"] = "pending"
             self._save(value)
 

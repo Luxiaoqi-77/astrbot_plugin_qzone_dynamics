@@ -68,6 +68,7 @@ class SafeDraftInput:
     primary_source_review_reason: str = ""
     # 2026-10-16：当天命中的"重要日子"（已按 qzone 渠道过滤、含侧重），供提示词注入。
     important_dates: tuple[str, ...] = ()
+    daily_schedule_context: str = ""
 
     @property
     def source_key(self) -> str:
@@ -153,7 +154,10 @@ def clean_source_text(
     """Normalize a whitelisted text field and enforce a bounded size."""
     if not isinstance(value, str):
         raise ValueError(f"{label} must be text")
-    cleaned = " ".join(value.split())
+    # 2026-10-21：模型会从对话历史里学来 wakeup 的 [NEXT: 45m]；说说文案也不能带出去。
+    from data.plugins.proactive_text_guard import strip_schedule_tags
+
+    cleaned = " ".join(strip_schedule_tags(value).split())
     if required and not cleaned:
         raise ValueError(f"{label} is required")
     if len(cleaned) > max_chars:
@@ -219,6 +223,7 @@ def source_fingerprint(source: SafeDraftInput) -> str:
         "source_date": source.source_date,
         "persona_label": source.persona_label,
         "activity": source.activity,
+        "daily_schedule_context": source.daily_schedule_context,
         "activity_status": source.activity_status,
         "activity_state": source.activity_state,
         "activity_interval": source.activity_interval,

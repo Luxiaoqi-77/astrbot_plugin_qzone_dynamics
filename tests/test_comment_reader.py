@@ -47,6 +47,7 @@ def _feed(total: int) -> dict[str, object]:
                 "uin": BOT_UIN,
                 "content": "合成动态正文",
                 "total_comment_count": total,
+                "cmtnum": total,
             }
         ],
     }
@@ -60,6 +61,28 @@ def _detail(total: int, comments: list[dict[str, object]]) -> dict[str, object]:
         "totalCommentCount": total,
         "commentlist": comments,
     }
+
+
+class RetryTransport(SyntheticTransport):
+    """Return an API error first, then success after the page token is read."""
+
+    def __init__(self, feed, home_html: str, first_detail, second_detail):
+        super().__init__(feed, first_detail)
+        self.home_html = home_html
+        self.second_detail = json.dumps(second_detail).encode()
+        self.detail_calls = 0
+
+    async def request(self, endpoint_key, *, query, **kwargs):
+        if endpoint_key == "get_qzone_home":
+            self.calls.append((endpoint_key, dict(query)))
+            return self.home_html.encode()
+        if endpoint_key == "get_post_detail":
+            self.calls.append((endpoint_key, dict(query)))
+            self.detail_calls += 1
+            if self.detail_calls >= 2:
+                return self.second_detail
+            return self.responses[endpoint_key]
+        return await super().request(endpoint_key, query=query, **kwargs)
 
 
 class QzoneCommentReaderTests(unittest.TestCase):
@@ -99,6 +122,241 @@ class QzoneCommentReaderTests(unittest.TestCase):
         )
         self.assertEqual(transport.calls[0][1]["pos"], "0")
         self.assertEqual(transport.calls[0][1]["num"], "100")
+
+    def test_feed_miss_falls_back_to_detail_by_post_id(self) -> None:
+        transport = SyntheticTransport(
+            {"code": 0, "msglist": []},
+            {
+                "ret": 0,
+                "uin": BOT_UIN,
+                "tid": POST_ID,
+                "content": "合成动态正文",
+                "cmtnum": 1,
+                "commentlist": [
+                    {
+                        "tid": "1",
+                        "uin": OWNER_UIN,
+                        "content": "合成评论",
+                        "replyNum": 0,
+                    }
+                ],
+            },
+        )
+
+        result = asyncio.run(
+            QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+        )
+
+        self.assertEqual(result["post_content"], "合成动态正文")
+        self.assertEqual(result["declared_comment_count"], 1)
+        self.assertEqual(
+            [row["comment_identity_key"] for row in result["comments"]],
+            ["top_level:1"],
+        )
+        self.assertEqual(
+            [call[0] for call in transport.calls],
+            ["list_owner_feeds", "get_post_detail"],
+        )
+
+    def test_feed_api_error_falls_back_to_detail(self) -> None:
+        transport = SyntheticTransport(
+            {"code": -1},
+            {
+                "ret": 0,
+                "uin": BOT_UIN,
+                "tid": POST_ID,
+                "content": "合成动态正文",
+                "cmtnum": 1,
+                "commentlist": [
+                    {
+                        "tid": "1",
+                        "uin": OWNER_UIN,
+                        "content": "合成评论",
+                        "replyNum": 0,
+                    }
+                ],
+            },
+        )
+
+        result = asyncio.run(
+            QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+        )
+
+        self.assertEqual(result["post_content"], "合成动态正文")
+        self.assertEqual(result["declared_comment_count"], 1)
+        self.assertEqual(
+            [call[0] for call in transport.calls],
+            ["list_owner_feeds", "get_post_detail"],
+        )
+
+    def test_zero_comment_feed_avoids_detail_api(self) -> None:
+        feed = {
+            "code": 0,
+            "msglist": [
+                {
+                    "tid": POST_ID,
+                    "uin": BOT_UIN,
+                    "content": "合成动态正文",
+                    "cmtnum": 0,
+                }
+            ],
+        }
+        transport = SyntheticTransport(feed, {"code": -10029})
+
+        result = asyncio.run(
+            QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+        )
+
+        self.assertEqual(result["declared_comment_count"], 0)
+        self.assertEqual(result["comments"], [])
+        self.assertEqual(
+            [call[0] for call in transport.calls], ["list_owner_feeds"]
+        )
+
+    def test_feed_commentlist_without_replynum_is_accepted(self) -> None:
+        feed = {
+            "code": 0,
+            "msglist": [
+                {
+                    "tid": POST_ID,
+                    "uin": BOT_UIN,
+                    "content": "合成动态正文",
+                    "cmtnum": 1,
+                    "has_more_con": False,
+                    "commentlist": [
+                        {
+                            "tid": "1",
+                            "uin": OWNER_UIN,
+                            "content": "合成评论",
+                            "list_3": [
+                                {
+                                    "tid": "1",
+                                    "uin": BOT_UIN,
+                                    "content": "合成回复",
+                                    "replyid": "1",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        transport = SyntheticTransport(feed, {"code": -10029})
+
+        result = asyncio.run(
+            QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+        )
+
+        self.assertEqual(result["declared_comment_count"], 2)
+        self.assertEqual(
+            [row["comment_identity_key"] for row in result["comments"]],
+            ["top_level:1", "reply:1:1"],
+        )
+
+    def test_detail_api_error_retries_with_page_token(self) -> None:
+        transport = RetryTransport(
+            {"code": 0, "msglist": []},
+            'window.g_qzonetoken = (function(){ try{return "TOKEN123";}'
+            'catch(e){return "";} })();',
+            {"code": -10029},
+            {
+                "ret": 0,
+                "uin": BOT_UIN,
+                "tid": POST_ID,
+                "content": "合成动态正文",
+                "cmtnum": 1,
+                "commentlist": [
+                    {
+                        "tid": "1",
+                        "uin": OWNER_UIN,
+                        "content": "合成评论",
+                        "replyNum": 0,
+                    }
+                ],
+            },
+        )
+
+        result = asyncio.run(
+            QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+        )
+
+        self.assertEqual(result["post_content"], "合成动态正文")
+        detail_queries = [
+            query for key, query in transport.calls if key == "get_post_detail"
+        ]
+        self.assertEqual(len(detail_queries), 2)
+        self.assertNotIn("qzonetoken", detail_queries[0])
+        self.assertEqual(detail_queries[1]["qzonetoken"], "TOKEN123")
+        self.assertEqual(detail_queries[1]["callback"], "_preloadCallback")
+
+    def test_detail_api_error_uses_feed_commentlist(self) -> None:
+        feed = {
+            "code": 0,
+            "msglist": [
+                {
+                    "tid": POST_ID,
+                    "uin": BOT_UIN,
+                    "content": "合成动态正文",
+                    "cmtnum": 1,
+                    "commentlist": [
+                        {
+                            "tid": "1",
+                            "uin": OWNER_UIN,
+                            "content": "合成评论",
+                            "replyNum": 1,
+                            "list_3": [
+                                {
+                                    "tid": "1",
+                                    "uin": BOT_UIN,
+                                    "content": "合成回复",
+                                    "replyid": "1",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        transport = SyntheticTransport(feed, {"code": -10029})
+
+        result = asyncio.run(
+            QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+        )
+
+        self.assertEqual(result["post_content"], "合成动态正文")
+        self.assertEqual(result["declared_comment_count"], 2)
+        self.assertEqual(
+            [row["comment_identity_key"] for row in result["comments"]],
+            ["top_level:1", "reply:1:1"],
+        )
+
+    def test_detail_api_error_has_distinct_reason(self) -> None:
+        transport = SyntheticTransport(_feed(1), {"code": -1})
+
+        with self.assertRaisesRegex(
+            QzoneCommentReadError, "comment_detail_api_error"
+        ):
+            asyncio.run(
+                QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+            )
+
+    def test_feed_ambiguity_still_fails_before_detail(self) -> None:
+        feed = {
+            "code": 0,
+            "msglist": [
+                {"tid": POST_ID, "uin": BOT_UIN, "content": "一"},
+                {"tid": POST_ID, "uin": BOT_UIN, "content": "二"},
+            ],
+        }
+        transport = SyntheticTransport(feed, _detail(0, []))
+
+        with self.assertRaisesRegex(
+            QzoneCommentReadError, "comment_post_not_found_or_ambiguous"
+        ):
+            asyncio.run(
+                QzoneCommentReader(transport).load_full_thread(BOT_UIN, POST_ID)
+            )
+        self.assertEqual([call[0] for call in transport.calls], ["list_owner_feeds"])
 
     def test_synthetic_count_truncation_is_rejected(self) -> None:
         transport = SyntheticTransport(

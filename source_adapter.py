@@ -8,6 +8,10 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from data.plugins.social_material_pool.schedule_context import (
+    read_daily_schedule_context,
+)
+
 from .core import SafeDraftInput, clean_source_text
 
 VIRTUAL_LIFE_PLUGIN_ID = "astrbot_plugin_virtual_life"
@@ -336,4 +340,7 @@ class VirtualLifeSourceAdapter:
             mood_time=mood_time,
             source_labels=source_labels,
             important_dates=important_dates,
+            daily_schedule_context=await read_daily_schedule_context(
+                self.context, persona_id=persona_id, now=current
+            ),
         )

@@ -15,7 +15,12 @@ from astrbot import logger
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
-from data.plugins.social_material_pool import SourceLedger, collect_material_sources
+from data.plugins.social_material_pool import (
+    SourceLedger,
+    collect_material_sources,
+    cross_platform_recent_posts,
+    sanitize_recent_texts,
+)
 
 from .adapters import (
     AstrBotTextGenerationAdapter,
@@ -79,6 +84,13 @@ except ImportError:
     AUTO_TARGET_UMO = "qq_napcat_100000002:FriendMessage:100000001"
     COMMENT_BOT_ACCOUNT_UIN = "100000002"
     COMMENT_OWNER_ACTOR_UIN = "100000001"
+
+
+# QQ Space topics include shared cat care; diary topics are Moment-only.
+QZONE_TOPIC_CHOICES = (
+    "日常", "美食", "音乐", "阅读", "小发现",
+    "星空", "植物", "逛街", "冷知识", "运动", "手作", "发呆", "夜宵", "共同养猫",
+)
 
 
 class QzoneDynamicsPlugin(Star):
@@ -160,15 +172,20 @@ class QzoneDynamicsPlugin(Star):
             activity_interval="",
             source_labels=common_labels,
         )
-        recent = [
-            draft.content
-            for draft in sorted(
-                (item for item in self.store.list() if item.status == "published"),
-                key=lambda item: item.published_at or item.created_at,
-                reverse=True,
-            )[:5]
-        ]
-        topic_choices = ["日常", "美食", "音乐", "阅读", "小发现"]
+        recent = sanitize_recent_texts(
+            [
+                draft.content
+                for draft in sorted(
+                    (item for item in self.store.list() if item.status == "published"),
+                    key=lambda item: item.published_at or item.created_at,
+                    reverse=True,
+                )[:5]
+            ]
+            + cross_platform_recent_posts("qzone", limit=3),
+            limit=5,
+        )
+        # 日记是 Moment 专属，不进此表（见 QZONE_TOPIC_CHOICES）。
+        topic_choices = QZONE_TOPIC_CHOICES
         candidates = await collect_material_sources(
             self.context,
             platform="qzone",
@@ -542,6 +559,11 @@ class QzoneDynamicsPlugin(Star):
             )
             result = sent.status
             remote_tid = sent.remote_tid
+            if sent.status == "published" and remote_tid:
+                try:
+                    await self._auto_comments.register_published_post(remote_tid)
+                except Exception as exc:
+                    logger.warning("[qzone] new post baseline unavailable (%s)", type(exc).__name__)
             if image_token:
                 if sent.status in {"published", "delivery_unknown"}:
                     # delivery_unknown 也按“已消耗配额”处理：宁可 48 小时
@@ -626,9 +648,23 @@ class QzoneDynamicsPlugin(Star):
                     key=lambda d: d.published_at or d.created_at, reverse=True,
                 )[:10]
                 for draft in posts:
-                    status = await self._auto_comments.poll_post(
-                        workflow, draft.remote_tid, ready=self._auto_comment_ready,
-                    )
+                    try:
+                        status = await self._auto_comments.poll_post(
+                            workflow, draft.remote_tid, ready=self._auto_comment_ready,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # 2026-10-31：单条说说读取失败不应中断其余说说的
+                        # 轮询；详情接口受限的旧帖不再阻塞最新帖子。
+                        # 只记录安全原因码，不记录正文、Cookie 或响应体。
+                        reason = getattr(exc, "code", None) or type(exc).__name__
+                        logger.warning(
+                            "[QzoneComments] post=%s deferred (%s)",
+                            draft.remote_tid,
+                            reason,
+                        )
+                        continue
                     if status != "idle":
                         logger.info("[QzoneComments] post=%s status=%s", draft.remote_tid, status)
             except asyncio.CancelledError:
@@ -915,15 +951,22 @@ class QzoneDynamicsPlugin(Star):
                 logger.warning("[qzone] local interaction sync deferred (%s)", type(exc).__name__)
             return raw
 
-        async def record_sent_reply(target, content, result):
+        async def record_sent_reply(target, content, result, *, verified_by_readback=False):
             """Keep an actual successful send in the dedicated local ledger.
 
             Args:
                 target: Exact confirmed owner reply target.
                 content: Text actually sent.
-                result: Business success response.
+                result: Business response, possibly ambiguous.
+                verified_by_readback: The exact reply was read back from the
+                    complete remote thread.
             """
-            self._comment_memory_outbox.record_sent(target, content, result)
+            self._comment_memory_outbox.record_sent(
+                target,
+                content,
+                result,
+                verified_by_readback=verified_by_readback,
+            )
             await self._comment_memory_outbox.flush(self.context, target.post_id)
 
         async def draft_generator(comment, post_content, *, thread_context=""):
@@ -1329,6 +1372,11 @@ class QzoneDynamicsPlugin(Star):
             yield event.plain_result(f"发布已拒绝：{exc}")
             return
         if draft.status == "published":
+            if queued_draft and queued_draft.status != "published":
+                try:
+                    await self._auto_comments.register_published_post(draft.remote_tid)
+                except Exception as exc:
+                    logger.warning("[qzone] new post baseline unavailable (%s)", type(exc).__name__)
             yield event.plain_result(
                 f"草稿 {draft.draft_id} 已发布，NapCat tid：{draft.remote_tid}。"
             )

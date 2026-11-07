@@ -60,6 +60,31 @@ class Workflow:
         return self.result
 
 
+class ReadbackWorkflow(Workflow):
+    """A workflow whose reply becomes visible only after the sender runs."""
+
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+        self.phase = "baseline"
+
+    async def thread_loader(self, account, post):
+        if self.phase == "baseline":
+            return thread([])
+        if self.sent:
+            return thread(
+                [
+                    row("1"),
+                    {
+                        "comment_id": "10",
+                        "author_uin": BOT,
+                        "content": f"@{{uin:{OWNER},nick:测试用户,who:1,auto:1}}{self.text}",
+                        "parent_comment_id": "1",
+                    },
+                ]
+            )
+        return thread([row("1")])
+
+
 def setup(tmp_path, **kwargs):
     service = AutoCommentReplies(
         tmp_path / "state.json", account_uin=BOT, owner_uin=OWNER
@@ -93,6 +118,44 @@ def test_new_owner_comment_sent_once_across_restart(tmp_path):
     assert "看什么书" not in service.path.read_text()
 
 
+def test_registered_new_post_does_not_swallow_first_owner_comment(tmp_path):
+    service, workflow = setup(tmp_path)
+    asyncio.run(service.register_published_post("post1"))
+    workflow.snapshot = thread([row()])
+    assert run(service, workflow) == "sent"
+    asyncio.run(service.register_published_post("post1"))
+    assert run(service, workflow) == "idle"
+    assert len(workflow.generated) == len(workflow.sent) == 1
+
+
+def test_ambiguous_send_verified_by_readback_is_recorded(tmp_path):
+    service = AutoCommentReplies(
+        tmp_path / "state.json", account_uin=BOT, owner_uin=OWNER
+    )
+    workflow = ReadbackWorkflow(tmp_path, result={"code": -1})
+    assert run(service, workflow) == "baseline"
+    workflow.phase = "active"
+    calls = []
+
+    async def on_sent(target, content, result, *, verified_by_readback=False):
+        calls.append(verified_by_readback)
+
+    workflow.on_sent = on_sent
+    assert run(service, workflow) == "sent"
+    assert len(workflow.sent) == 1
+    assert calls == [True]
+
+
+def test_non_json_reply_response_can_be_verified_without_resending(tmp_path):
+    service = AutoCommentReplies(tmp_path / "state.json", account_uin=BOT, owner_uin=OWNER)
+    workflow = ReadbackWorkflow(tmp_path, result=ValueError("non-JSON iframe response"))
+    assert run(service, workflow) == "baseline"
+    workflow.phase = "active"
+    assert run(service, workflow) == "sent"
+    assert run(service, workflow) == "idle"
+    assert len(workflow.generated) == len(workflow.sent) == 1
+
+
 @pytest.mark.parametrize(
     "result", [RuntimeError("timeout"), {"code": 0}, {"ret": -1, "code": 0}]
 )
@@ -105,7 +168,7 @@ def test_unknown_outcome_never_retries(tmp_path, result):
     assert len(workflow.sent) == len(workflow.generated) == 1
 
 
-@pytest.mark.parametrize("text", ["", "好" * 21])
+@pytest.mark.parametrize("text", ["", "好" * 26])
 def test_invalid_length_is_not_sent_or_regenerated(tmp_path, text):
     service, workflow = setup(tmp_path, text=text)
     run(service, workflow)
@@ -116,8 +179,8 @@ def test_invalid_length_is_not_sent_or_regenerated(tmp_path, text):
     assert not workflow.sent
 
 
-def test_exact_twenty_characters_allowed(tmp_path):
-    service, workflow = setup(tmp_path, text="好" * 20)
+def test_exact_twenty_five_characters_allowed(tmp_path):
+    service, workflow = setup(tmp_path, text="好" * 25)
     run(service, workflow)
     workflow.snapshot = thread([row()])
     assert run(service, workflow) == "sent"
@@ -274,7 +337,14 @@ def test_thread_context_contains_reply_chain(tmp_path):
     assert "你（小回）: 看什么书" in context
 
 
-def test_readback_confirms_delivery_when_response_shape_is_unknown(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reply_content,expected_status", [
+    (f"@{{uin:{OWNER},nick:测试用户,who:1,auto:1}}那我陪你", "sent"),
+    ("那我陪你", "delivery_unknown"),
+    (f"@{{uin:{BOT},nick:其他对象,who:1,auto:1}}那我陪你", "delivery_unknown"),
+])
+def test_readback_confirms_delivery_when_response_shape_is_unknown(
+    tmp_path, monkeypatch, reply_content, expected_status,
+):
     async def _no_sleep(_seconds):
         return None
 
@@ -287,7 +357,7 @@ def test_readback_confirms_delivery_when_response_shape_is_unknown(tmp_path, mon
         [row("1", OWNER, ""), row("2", BOT, "1"), row("3", OWNER, "2")]
     )
     workflow.text = "那我陪你"
-    # 发送后线程里出现小回的回复 → 回读确认为 sent。
+    # 同楼同正文仍需核对对象，缺标记或指向他人不能确认为成功。
     original_loader = workflow.thread_loader
 
     async def loader(account, post):
@@ -300,14 +370,14 @@ def test_readback_confirms_delivery_when_response_shape_is_unknown(tmp_path, mon
             {
                 "comment_id": "4",
                 "author_uin": BOT,
-                "content": "那我陪你",
+                "content": reply_content,
                 "parent_comment_id": "1",
             }
         )
         return snapshot
 
     workflow.thread_loader = loader
-    assert run(service, workflow) == "sent"
+    assert run(service, workflow) == expected_status
 
 
 def test_readback_without_the_reply_keeps_unknown(tmp_path, monkeypatch):

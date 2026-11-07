@@ -34,20 +34,20 @@ def test_generation_includes_persona_memory_and_thread_with_hard_cap(monkeypatch
     )
     assert result == "一起看吗？"
     request = adapter._complete.call_args.kwargs
-    # 先允许一个多余句号（去句号后再按 20 字硬校验）。
-    assert request["max_chars"] == 21
+    # 先允许一个多余句号（去句号后再按 25 字硬校验）。
+    assert request["max_chars"] == 26
     assert "测试人设" in request["system_prompt"]
     payload = json.loads(request["prompt"].split("\n", 1)[1])
     assert payload["relevant_star_map_memories"] == ["测试阅读记忆"]
     assert payload["comment_thread"] == "前面聊过书名"
 
 
-def test_model_output_over_twenty_is_rejected(monkeypatch):
+def test_model_output_over_twenty_five_is_rejected(monkeypatch):
     monkeypatch.setattr(
         adapters, "load_reply_context", AsyncMock(return_value=("测试人设", []))
     )
     provider = SimpleNamespace(
-        text_chat=AsyncMock(return_value=SimpleNamespace(completion_text="好" * 21))
+        text_chat=AsyncMock(return_value=SimpleNamespace(completion_text="好" * 26))
     )
     adapter = adapters.AstrBotTextGenerationAdapter(SimpleNamespace())
     adapter._candidate_providers = AsyncMock(return_value=[("fake", provider)])
@@ -167,10 +167,10 @@ def test_period_does_not_consume_the_character_budget(monkeypatch):
         adapters, "load_reply_context", AsyncMock(return_value=("测试人设", []))
     )
     adapter = adapters.AstrBotTextGenerationAdapter(SimpleNamespace())
-    adapter._complete = AsyncMock(return_value="好" * 20 + "。")
+    adapter._complete = AsyncMock(return_value="好" * 25 + "。")
     result = asyncio.run(
         adapter.generate_comment_reply(
             SimpleNamespace(content="评论"), "正文", umo=UMO
         )
     )
-    assert result == "好" * 20
+    assert result == "好" * 25

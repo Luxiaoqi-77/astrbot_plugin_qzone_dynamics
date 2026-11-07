@@ -16,7 +16,10 @@ SERVER_COMMENT_TOTAL_PATHS = frozenset(
     f"{source}.{field}"
     for source in ("feed", "feed.data", "detail", "detail.data")
     for field in SERVER_COMMENT_TOTAL_FIELDS
-) | {"detail.cmtnum+sum(commentlist.replyNum)"}
+) | {
+    "detail.cmtnum+sum(commentlist.replyNum)", "feeds3.commentcnt",
+    "feeds3.opcnt2.CS", "feeds3.opcnt2.CS+embedded_replies",
+}
 
 
 def normalize_post_id(value: object) -> str:
@@ -48,6 +51,7 @@ class VerifiedComment:
     content: str
     parent_comment_id: str = ""
     identity_key: str = ""
+    author_nickname: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,8 @@ class ExactReplyTarget:
     # 2026-10-20：QQ空间楼层是两层结构，回复接口只认主评论 ID。
     # 楼内追问的目标 ID 另存，发请求时用 thread_root_comment_id。
     thread_root_comment_id: str = ""
+    thread_root_author_uin: str = ""
+    target_nickname: str = ""
 
 
 _QZONE_MENTION = re.compile(r"@\{uin:\d+,nick:([^,}]*),who:\d+,auto:\d+\}")
@@ -76,6 +82,27 @@ def clean_comment_text(text: str) -> str:
         lambda match: f"@{match.group(1)}" if match.group(1) else "", str(text or "")
     )
     return " ".join(cleaned.split())
+
+
+def build_reply_content(content: str, target_uin: str, nickname: str = "") -> str:
+    """Attach QQ's native reply target, keeping nickname text inside its field."""
+    if not re.fullmatch(r"[0-9]{5,12}", target_uin):
+        raise ValueError("reply target UIN is invalid")
+    # Commas/braces delimit QQ's markup; names must not inject extra fields.
+    safe_name = " ".join(str(nickname or "").split()).translate(
+        str.maketrans({",": "，", "{": "｛", "}": "｝"})
+    )[:128] or target_uin
+    return f"@{{uin:{target_uin},nick:{safe_name},who:1,auto:1}}{content}"
+
+
+def matches_reply_content(content: str, target_uin: str, expected: str) -> bool:
+    """Require the native target and body, rather than only a reply in the same floor."""
+    match = _QZONE_MENTION.match(str(content or ""))
+    return bool(
+        match
+        and match.group(0).startswith(f"@{{uin:{target_uin},")
+        and clean_comment_text(content[match.end():]) == clean_comment_text(expected)
+    )
 
 
 def strip_trailing_period(text: str) -> str:
@@ -209,6 +236,8 @@ def bind_reply_target(
     duplicate_raw_ids = len({comment.comment_id for comment in comments}) != len(comments)
     for item in sorted(comments, key=lambda item: (item.parent_comment_id, item.comment_id)):
         row = asdict(item)
+        # Nickname presentation must not invalidate existing thread fingerprints.
+        row.pop("author_nickname", None)
         row["identity_key"] = item.identity_key or comment_identity_key(
             item.comment_id, item.parent_comment_id
         )
@@ -238,6 +267,8 @@ def bind_reply_target(
         parent_identity_key=target.identity_key or comment_identity_key(target.comment_id),
         legacy_idempotency_key=legacy_idempotency_key,
         thread_root_comment_id=root.comment_id,
+        thread_root_author_uin=root.author_uin,
+        target_nickname=target.author_nickname,
     )
 
 

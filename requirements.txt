@@ -1,0 +1,2 @@
+beautifulsoup4>=4.12,<5
+json5>=0.12,<1

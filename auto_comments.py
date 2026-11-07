@@ -7,7 +7,12 @@ import json
 import os
 from pathlib import Path
 
-from .comment_reply import bind_reply_target, clean_comment_text, comment_identity_key
+from .comment_reply import (
+    bind_reply_target,
+    clean_comment_text,
+    comment_identity_key,
+    matches_reply_content,
+)
 from .comment_workflow import _community_success, normalize_comment_thread
 
 
@@ -60,6 +65,16 @@ class AutoCommentReplies:
         temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         os.replace(temporary, self.path)
 
+    async def register_published_post(self, post_id):
+        """Start empty only for a newly confirmed publication; never reset seen replies."""
+        from .comment_reply import normalize_post_id
+        post_id = normalize_post_id(post_id)
+        async with self.lock:
+            state = self._load()
+            if post_id not in state["posts"]:
+                state["posts"][post_id] = {}
+                self._save(state)
+
     async def _verify_delivered(self, workflow, post_id: str, target, content: str) -> str:
         """Confirm a reply by reading it back; failure keeps the safe unknown state.
 
@@ -79,7 +94,7 @@ class AutoCommentReplies:
             if any(
                 comment.author_uin == self.account_uin
                 and comment.parent_comment_id == root
-                and clean_comment_text(comment.content) == expected
+                and matches_reply_content(comment.content, target.target_uin, expected)
                 for comment in snapshot["comments"]
             ):
                 return "sent"
@@ -171,10 +186,10 @@ class AutoCommentReplies:
                     )
                     if (
                         not isinstance(content, str)
-                        or not 0 < len(content.strip()) <= 20
+                        or not 0 < len(content.strip()) <= 25
                     ):
                         raise ValueError(
-                            "automatic reply must contain 1 to 20 characters"
+                            "automatic reply must contain 1 to 25 characters"
                         )
                     current = normalize_comment_thread(
                         await workflow.thread_loader(self.account_uin, post_id)
@@ -206,6 +221,8 @@ class AutoCommentReplies:
                     seen[key] = "claimed"
                     self._save(state)
                     return seen[key]
+                result = None
+                verified_by_readback = False
                 status = "delivery_unknown"
                 try:
                     result = await workflow.sender(target, content.strip())
@@ -217,18 +234,31 @@ class AutoCommentReplies:
                         status = await self._verify_delivered(
                             workflow, post_id, target, content.strip()
                         )
+                        verified_by_readback = status == "sent"
                 except asyncio.CancelledError:
                     workflow.receipts.finish(target, status=status)
                     seen[key] = status
                     self._save(state)
                     raise
                 except Exception:
-                    pass
+                    # Qzone may accept a reply but return a non-JSON iframe body.
+                    # Only a fresh, exact-target readback can turn that into sent.
+                    status = await self._verify_delivered(
+                        workflow, post_id, target, content.strip()
+                    )
+                    verified_by_readback = status == "sent"
                 workflow.receipts.finish(target, status=status)
                 seen[key] = status
                 self._save(state)
                 if status == "sent" and workflow.on_sent is not None:
-                    await workflow.on_sent(target, content.strip(), result)
+                    # 2026-10-31：接口返回不确定但回读已确认这条回复时，
+                    # 也要写入星图快照，否则这条回复会永久缺失。
+                    await workflow.on_sent(
+                        target,
+                        content.strip(),
+                        result,
+                        verified_by_readback=verified_by_readback,
+                    )
                 return status
             self._save(state)
             return "idle"

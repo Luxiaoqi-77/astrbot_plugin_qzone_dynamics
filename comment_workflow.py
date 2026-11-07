@@ -120,6 +120,7 @@ def normalize_comment_thread(snapshot: Mapping[str, object]) -> dict[str, object
                 content=content,
                 parent_comment_id=normalized_parent_id,
                 identity_key=expected_identity_key,
+                author_nickname=row.get("name", "") if isinstance(row.get("name", ""), str) else "",
             )
         )
     identities = [comment.identity_key for comment in comments]

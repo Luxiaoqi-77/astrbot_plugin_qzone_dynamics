@@ -14,7 +14,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from .comment_reply import normalize_post_id
+from .comment_reply import build_reply_content, normalize_post_id
 
 KEYCHAIN_SERVICE = "com.astrbot.qzone-dynamics.qzone-cookie"
 ALLOWED_QQ_HOSTS = frozenset(
@@ -26,6 +26,20 @@ ALLOWED_QQ_HOSTS = frozenset(
 )
 MAX_COOKIE_CHARS = 16 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+
+
+async def _read_bounded(content) -> bytes:
+    """Read through EOF: StreamReader.read(n) may return only the first chunk."""
+    parts = []
+    size = 0
+    while True:
+        part = await content.read(min(65536, MAX_RESPONSE_BYTES + 1 - size))
+        if not part:
+            return b"".join(parts)
+        size += len(part)
+        if size > MAX_RESPONSE_BYTES:
+            raise CommentTransportBlocked("qzone_response_too_large")
+        parts.append(part)
 
 
 class CommentTransportBlocked(RuntimeError):
@@ -63,6 +77,11 @@ DETAIL_ENDPOINT = QzoneEndpoint(
     path="/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6",
     method="GET",
 )
+QZONE_HOME_ENDPOINT = QzoneEndpoint(
+    host="user.qzone.qq.com",
+    path="/{uin}/main",
+    method="GET",
+)
 COMMENT_ENDPOINT = QzoneEndpoint(
     host="user.qzone.qq.com",
     path="/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds",
@@ -77,12 +96,32 @@ REPLY_ENDPOINT = QzoneEndpoint(
 # Fixed routes copied from community implementation sources. The transport is
 # still disabled by default and does not read Keychain until explicitly enabled.
 COMMENT_ENDPOINTS = {
+    "get_post_counts": QzoneEndpoint(
+        "user.qzone.qq.com",
+        "/proxy/domain/r.qzone.qq.com/cgi-bin/user/qz_opcnt2",
+        "GET",
+    ),
+    "list_owner_feeds_html": QzoneEndpoint(
+        "user.qzone.qq.com",
+        "/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more",
+        "GET",
+    ),
     "list_owner_feeds": FEEDS_ENDPOINT,
     "get_post_detail": DETAIL_ENDPOINT,
+    "get_qzone_home": QZONE_HOME_ENDPOINT,
     "submit_comment": COMMENT_ENDPOINT,
     "reply_comment": REPLY_ENDPOINT,
 }
-GTK_ENDPOINT_KEYS = frozenset(COMMENT_ENDPOINTS)
+GTK_ENDPOINT_KEYS = frozenset(
+    {
+        "get_post_counts",
+        "list_owner_feeds_html",
+        "list_owner_feeds",
+        "get_post_detail",
+        "submit_comment",
+        "reply_comment",
+    }
+)
 _EXTRA_HEADER_ALLOWLIST = frozenset(
     {
         "Accept",
@@ -116,6 +155,8 @@ def build_zhalslar_reply_request(
     content: str,
     comment_id: str,
     comment_uin: str,
+    reply_uin: str = "",
+    reply_nickname: str = "",
 ) -> QzoneCommentRequest:
     """Build the exact H5 reply shape observed in the referenced community source."""
     for name, value in (
@@ -146,7 +187,7 @@ def build_zhalslar_reply_request(
             "platformid": "52",
             "format": "fs",
             "ref": "feeds",
-            "content": content,
+            "content": build_reply_content(content, reply_uin or comment_uin, reply_nickname),
             "commentId": str(comment_id),
             "commentUin": str(comment_uin),
             "richval": "",
@@ -441,9 +482,15 @@ class QzoneDirectTransport:
                 factory = self.session_factory
                 timeout = 12.0
             async with factory(timeout=timeout, trust_env=False) as session:
+                account_uin = str(self.credential_store.account_uin)
+                if not re.fullmatch(r"[0-9]{5,12}", account_uin):
+                    raise CommentTransportBlocked(
+                        "qzone_credential_account_mismatch"
+                    )
+                path = endpoint.path.replace("{uin}", account_uin)
                 async with session.request(
                     endpoint.method,
-                    f"https://{endpoint.host}{endpoint.path}",
+                    f"https://{endpoint.host}{path}",
                     headers=headers,
                     params=query_values or None,
                     data=data,
@@ -455,10 +502,7 @@ class QzoneDirectTransport:
                     content_length = response.headers.get("Content-Length", "")
                     if content_length.isdigit() and int(content_length) > MAX_RESPONSE_BYTES:
                         raise CommentTransportBlocked("qzone_response_too_large")
-                    body = await response.content.read(MAX_RESPONSE_BYTES + 1)
-                    if len(body) > MAX_RESPONSE_BYTES:
-                        raise CommentTransportBlocked("qzone_response_too_large")
-                    return body
+                    return await _read_bounded(response.content)
         except CommentTransportBlocked:
             raise
         except asyncio.CancelledError:
