@@ -277,6 +277,37 @@ class DraftStore:
         )
         os.replace(temporary, self.path)
 
+    def register_signature_post(self, snapshot, activity):
+        """Register an already verified publication without publishing again."""
+        from .signature_posts import matches_signature
+        from .comment_reply import normalize_post_id
+        post_id = normalize_post_id(snapshot["post_id"])
+        account = str(activity["account_id"])
+        published = activity.get("published_at")
+        updated = activity.get("updated_at")
+        import math
+        if (any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x <= 0 for x in (published, updated))
+                or not updated - 120 <= published <= updated + 21600):
+            raise ValueError("signature_publication_time_invalid")
+        if str(snapshot["post_author_uin"]) != account or str(snapshot["account_uin"]) != account or not matches_signature(snapshot["post_content"], activity["signature"]):
+            raise ValueError("signature_publication_mismatch")
+        with self.lock:
+            drafts = self._load()
+            existing = next((d for d in drafts.values() if d.status == "published" and d.remote_tid == post_id), None)
+            if existing is not None:
+                return existing
+            stamp = datetime.fromtimestamp(float(activity["published_at"]), timezone.utc).isoformat()
+            draft = Draft(
+                draft_id="sig_" + hashlib.sha256(post_id.encode()).hexdigest()[:12],
+                content=snapshot["post_content"], status="published", created_at=stamp,
+                source_key="signature:" + str(activity["action_id"]), source_date=stamp[:10],
+                remote_tid=post_id, published_at=stamp, memory_sync_state="pending",
+                source_labels=("QQ个性签名同步动态",), material_family="qq_signature",
+            )
+            drafts[draft.draft_id] = draft
+            self._save(drafts)
+            return draft
+
     def create_or_update_source(self, source: SafeDraftInput, content: str) -> tuple[Draft, str]:
         """Keep one draft per persona/day and reset review when its text changes."""
         with self.lock:

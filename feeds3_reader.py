@@ -95,6 +95,18 @@ def _comment(node, parent=""):
     }
 
 
+def feed_post_text(summary, owner):
+    """Exclude the server-rendered author label from signature cards."""
+    fragment = BeautifulSoup(str(summary), "html.parser")
+    label = fragment.select_one('a.nickname[link="nameCard_' + str(owner) + '"]')
+    if label is not None:
+        separator = label.find_next_sibling("span", class_="state")
+        if separator is not None and separator.get_text(strip=True) in {":", "："}:
+            separator.decompose()
+            label.decompose()
+    return fragment.get_text(" ", strip=True)
+
+
 def parse_feeds3_thread(body, owner, post, *, max_comments=20, server_count=None):
     snapshots = []
     for item in decode_feeds3(body):
@@ -162,7 +174,7 @@ def parse_feeds3_thread(body, owner, post, *, max_comments=20, server_count=None
                 "account_uin": owner,
                 "post_id": post,
                 "post_author_uin": owner,
-                "post_content": summary.get_text(" ", strip=True),
+                "post_content": feed_post_text(summary, owner),
                 "declared_comment_count": count,
                 "server_count_evidence": {evidence_key: count},
                 "comments": rows,

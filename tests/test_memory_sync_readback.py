@@ -128,3 +128,44 @@ def test_unconfirmed_business_failure_still_raises(tmp_path):
 
     with pytest.raises(MemorySyncBlocked):
         outbox.record_sent(_target(), "合成回复", {"code": -1})
+
+
+def _remote_snapshot(reply='合成回复'):
+    from astrbot_plugin_qzone_dynamics.comment_reply import build_reply_content
+    return normalize_comment_thread({
+        'account_uin': ASSISTANT_ID, 'post_author_uin': ASSISTANT_ID,
+        'post_id': POST, 'post_content': '合成动态正文',
+        'declared_comment_count': 2,
+        'server_count_evidence': {'detail.totalCommentCount': 2},
+        'comments': [
+            {'comment_id': '1', 'author_uin': OWNER_ID, 'content': '合成评论'},
+            {'comment_id': '1', 'author_uin': ASSISTANT_ID,
+             'content': build_reply_content(reply, OWNER_ID, '合成用户'), 'parent_comment_id': '1'},
+        ],
+    })
+
+
+def test_sent_reply_native_mention_keeps_the_same_source_and_content(tmp_path):
+    outbox, path = _outbox(tmp_path)
+    outbox.record_sent(_target(), '合成回复', {'code': 0, 'ret': 0})
+    before = outbox._load()['posts'][POST]['payload']['comments'][-1]
+    assert outbox.observe(_remote_snapshot(), outbox.begin_observation())
+    payload = outbox._load()['posts'][POST]['payload']
+    assert not payload['deleted_source_ids']
+    assert payload['comments'][-1]['source_id'] == before['source_id']
+    assert payload['comments'][-1]['content'] == before['content']
+
+
+def test_already_observed_readback_does_not_append_duplicate_sent_reply(tmp_path):
+    outbox, path = _outbox(tmp_path)
+    outbox.observe(_remote_snapshot(), outbox.begin_observation())
+    outbox.record_sent(_target(), '合成回复', None, verified_by_readback=True)
+    assert len(outbox._load()['posts'][POST]['payload']['comments']) == 2
+
+
+def test_flat_floor_followup_records_against_existing_root(tmp_path):
+    from dataclasses import replace
+    outbox, path = _outbox(tmp_path)
+    target = replace(_target(), parent_comment_id='2', parent_identity_key='reply:1:2', thread_root_comment_id='1')
+    outbox.record_sent(target, '合成追问回复', {'code': 0, 'ret': 0})
+    assert outbox._load()['posts'][POST]['payload']['comments'][-1]['parent_id'] == 'comment:1'

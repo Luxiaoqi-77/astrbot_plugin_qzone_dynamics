@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .comment_reply import matches_reply_content
+
 # 2026-10-17：公开仓库只保留占位符。真实账号放在 **不入库** 的 local_deployment.py
 # （与 main.py 同一套机制）；缺失时回退占位符（= 同步闸门全关，不会猜号）。
 try:  # pragma: no cover - 部署相关，跑测试走回退分支
@@ -257,14 +259,19 @@ class QzoneMemoryOutbox:
                     for node in nodes
                     if node["author_id"] == prior["author_id"]
                     and node["parent_id"] == prior["parent_id"]
-                    and node["content"] == prior["content"]
+                    and (node["content"] == prior["content"]
+                         or matches_reply_content(node["content"], OWNER_ID, prior["content"]))
                 ]
                 if len(matches) > 1:
                     raise MemorySyncBlocked("sent_reply_remote_match_ambiguous")
                 if matches:
                     aliases[matches[0]["source_id"]] = prior["source_id"]
+            prior_by_id = {node["source_id"]: node for node in old.get("comments", [])}
             for node in nodes:
-                node["source_id"] = aliases.get(node["source_id"], node["source_id"])
+                original_id = node["source_id"]
+                node["source_id"] = aliases.get(original_id, original_id)
+                if original_id in aliases:
+                    node["content"] = prior_by_id[node["source_id"]]["content"]
                 node["parent_id"] = aliases.get(node["parent_id"], node["parent_id"])
             retired = set(old.get("deleted_source_ids", [])) | (
                 {node["source_id"] for node in old.get("comments", [])}
@@ -333,11 +340,20 @@ class QzoneMemoryOutbox:
         with self.lock:
             value = self._load()
             receipt = value["posts"].get(target.post_id)
-            if not receipt or f"comment:{target.parent_comment_id}" not in {
+            root = target.thread_root_comment_id or target.parent_comment_id
+            if not receipt or f"comment:{root}" not in {
                 node["source_id"] for node in receipt["payload"]["comments"]
             }:
                 raise MemorySyncBlocked("verified_reply_parent_missing")
             payload = receipt["payload"]
+            existing = [node for node in payload["comments"]
+                        if node["author_id"] == ASSISTANT_ID
+                        and node["parent_id"] == f"comment:{root}"
+                        and matches_reply_content(node["content"], OWNER_ID, content)]
+            if len(existing) > 1:
+                raise MemorySyncBlocked("sent_reply_remote_match_ambiguous")
+            if existing:
+                return
             sid = f"reply:{target.idempotency_key}"
             if sid in {node["source_id"] for node in payload["comments"]}:
                 return
@@ -346,7 +362,7 @@ class QzoneMemoryOutbox:
             node = {
                 "source_id": sid,
                 "remote_id": "",
-                "parent_id": f"comment:{target.parent_comment_id}",
+                "parent_id": f"comment:{root}",
                 "author_kind": "assistant",
                 "author_id": ASSISTANT_ID,
                 "content": content,

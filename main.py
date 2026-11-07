@@ -627,6 +627,29 @@ class QzoneDynamicsPlugin(Star):
             return False, "手动评论回复功能当前关闭。"
         return True, ""
 
+    async def _discover_signature_publication(self, workflow):
+        """Adopt only an exact, recent signature post into the normal workflow."""
+        metadata = self.context.get_registered_star("astrbot_plugin_qqprofile")
+        profile = getattr(metadata, "star_cls", None) if metadata is not None and getattr(metadata, "activated", True) else None
+        getter = getattr(profile, "get_signature_activity", None)
+        if not callable(getter):
+            return
+        activity = getter()
+        if not activity or activity.get("post_id") or activity.get("owner_umo") != AUTO_TARGET_UMO or str(activity.get("account_id")) != COMMENT_BOT_ACCOUNT_UIN:
+            return
+        from .signature_posts import discover_signature_post
+        candidate = await discover_signature_post(workflow.signature_transport, activity)
+        if candidate is None:
+            return
+        snapshot = normalize_comment_thread(await workflow.thread_loader(COMMENT_BOT_ACCOUNT_UIN, candidate["post_id"]))
+        receipt = dict(activity, published_at=candidate["created_at"])
+        draft = self.store.register_signature_post(snapshot, receipt)
+        # An existing observed post gets the usual baseline. New publications
+        # start with no seen comments so comments made just after posting count.
+        if activity.get("evidence") != "verified_existing_post":
+            await self._auto_comments.register_published_post(draft.remote_tid)
+        profile.mark_signature_post(activity["action_id"], draft.remote_tid)
+
     def _auto_comment_ready(self):
         """Require explicit opt-in and the exact deployed owner/account scope."""
         return (
@@ -643,6 +666,10 @@ class QzoneDynamicsPlugin(Star):
         while self._auto_comment_ready():
             try:
                 workflow = self._comment_reply_workflow(enabled=True, umo=AUTO_TARGET_UMO)
+                try:
+                    await self._discover_signature_publication(workflow)
+                except Exception as exc:
+                    logger.warning("[QzoneComments] signature discovery deferred (%s)", type(exc).__name__)
                 posts = sorted(
                     (d for d in self.store.list() if d.status == "published" and d.remote_tid),
                     key=lambda d: d.published_at or d.created_at, reverse=True,
@@ -974,7 +1001,7 @@ class QzoneDynamicsPlugin(Star):
                 comment, post_content, umo=umo, thread_context=thread_context,
             )
 
-        return CommentReplyWorkflow(
+        workflow = CommentReplyWorkflow(
             enabled=enabled,
             draft_store=self._comment_reply_drafts,
             receipts=self._comment_reply_receipts,
@@ -983,6 +1010,8 @@ class QzoneDynamicsPlugin(Star):
             sender=sender,
             on_sent=record_sent_reply,
         )
+        workflow.signature_transport = transport
+        return workflow
 
     @staticmethod
     def _get_camera_generator() -> object | None:

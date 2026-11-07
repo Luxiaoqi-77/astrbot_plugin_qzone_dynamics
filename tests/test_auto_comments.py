@@ -393,3 +393,17 @@ def test_readback_without_the_reply_keeps_unknown(tmp_path, monkeypatch):
     )
     assert run(service, workflow) == "delivery_unknown"
     assert len(workflow.sent) == 1
+
+
+def test_flat_floor_supports_repeated_owner_followups_once_each(tmp_path):
+    service, workflow = setup(tmp_path)
+    workflow.snapshot = thread([row('1', OWNER), row('1', BOT, '1')])
+    assert run(service, workflow) == 'baseline'
+    workflow.snapshot = thread([row('1', OWNER), row('1', BOT, '1'), row('2', OWNER, '1')])
+    assert run(service, workflow) == 'sent'
+    assert run(service, workflow) == 'idle'
+    workflow.snapshot = thread([row('1', OWNER), row('1', BOT, '1'), row('2', OWNER, '1'), row('3', BOT, '1'), row('4', OWNER, '1')])
+    assert run(service, workflow) == 'sent'
+    assert run(service, workflow) == 'idle'
+    assert workflow.generated == ['2', '4']
+    assert all(target.thread_root_comment_id == '1' for target, _ in workflow.sent)
